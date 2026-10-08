@@ -2,8 +2,10 @@ package server
 
 import (
 	"crypto/tls"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Kiowx/opencode-cc/internal/api"
@@ -20,6 +22,13 @@ type Server struct {
 	httpClient   *http.Client
 	srv          *http.Server
 	effortLevels *EffortLevelsCache
+
+	// done is closed by Shutdown to stop background loops (keep-alive pinger).
+	done chan struct{}
+	// keepAliveOnce guards against starting the pinger twice.
+	keepAliveOnce sync.Once
+	// stopOnce guards closing done exactly once.
+	stopOnce sync.Once
 }
 
 // New constructs a Server. The store may be nil if request logging is disabled.
@@ -32,12 +41,35 @@ func New(cfg *config.Config, st *store.Store) *Server {
 		cfg:          cfg,
 		store:        st,
 		effortLevels: LoadEffortLevelsCache(dataDir),
+		done:         make(chan struct{}),
 		httpClient: &http.Client{
 			Timeout: 0, // streaming: no global timeout (per-request override used)
 			Transport: &http.Transport{
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 16,
-				IdleConnTimeout:     90 * time.Second,
+				MaxIdleConns: 256,
+				// Concurrency headroom so agent bursts (parallel subagents +
+				// retries) reuse pooled sockets instead of opening new ones.
+				MaxIdleConnsPerHost: 32,
+				// Explicit dialer. Without this the transport silently uses
+				// net/http's default (30s KeepAlive, 30s dial timeout), which
+				// is shorter than our idle window and lets the OS reap a warm
+				// socket early. KeepAlive outlives upstreamIdleTimeout so a
+				// pooled connection is never torn down underneath the pool;
+				// Timeout bounds the TCP connect on a cold connection.
+				DialContext: (&net.Dialer{
+					Timeout:   10 * time.Second,
+					KeepAlive: 75 * time.Minute,
+				}).DialContext,
+				// Cold-connection cliff (measured Oct 2026): a request arriving
+				// after >90s of upstream idleness must re-handshake TLS, which
+				// costs ~600ms of TTFT (full handshake measured at 562ms; the
+				// edge TTFB itself is only ~450ms). Paired A/B against the
+				// upstream showed warm pooled connections are ~610ms faster
+				// per request than fresh ones, and that HTTP/1.1 vs HTTP/2 is
+				// irrelevant while warm (498ms vs 520ms TTFB) - so a long idle
+				// timeout is strictly better than any protocol change.
+				// keepWarmUpstreams() pings the pool well inside this window so
+				// sockets stay usable across long thinking gaps.
+				IdleConnTimeout: upstreamIdleTimeout,
 				// Bound the wait for upstream response headers on every
 				// request, streams included.
 				ResponseHeaderTimeout: 30 * time.Second,
@@ -117,11 +149,21 @@ func (s *Server) Start(handler http.Handler) error {
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout left at 0 so long streams are not killed.
 	}
+	// Hold upstream sockets warm so the first turn after an idle gap skips the
+	// ~610ms cold-connection handshake.
+	s.StartKeepAlive()
 	return s.srv.ListenAndServe()
 }
 
 // Shutdown gracefully stops the server.
 func (s *Server) Shutdown() error {
+	// Stop the keep-alive pinger first so it cannot open new upstream requests
+	// while connections drain. sync.Once keeps a double Shutdown safe.
+	s.stopOnce.Do(func() {
+		if s.done != nil {
+			close(s.done)
+		}
+	})
 	if s.srv == nil {
 		return nil
 	}

@@ -190,6 +190,33 @@ func toolFrames() [][2]string {
 	}
 }
 
+// bridgeStreamSummary checks actual downstream SSE events, rather than
+// substring counts (which can count names in unrelated event payloads).
+func bridgeStreamSummary(t *testing.T, body string) (text string, events map[string]int, delta map[string]any) {
+	t.Helper()
+	events = make(map[string]int)
+	if err := scanAnthropicSSE(strings.NewReader(body), func(event string, data []byte) error {
+		events[event]++
+		var payload map[string]any
+		if err := json.Unmarshal(data, &payload); err != nil {
+			return err
+		}
+		if event == "content_block_delta" {
+			part, _ := payload["delta"].(map[string]any)
+			if part["type"] == "text_delta" {
+				text += part["text"].(string)
+			}
+		}
+		if event == "message_delta" {
+			delta = payload
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("parse bridge SSE: %v\n%s", err, body)
+	}
+	return
+}
+
 func TestBridgeToollessResampleRescuesStream(t *testing.T) {
 	hits := 0
 	zen := flakyResponsesZen(t, true, &hits)
@@ -208,10 +235,21 @@ func TestBridgeToollessResampleRescuesStream(t *testing.T) {
 		t.Fatalf("upstream hits = %d, want 2 (original + one resample)", hits)
 	}
 	body := rec.Body.String()
-	for _, want := range []string{`"type":"tool_use"`, `"name":"get_time"`, `"stop_reason":"tool_use"`} {
-		if !strings.Contains(body, want) {
-			t.Errorf("rescued stream missing %q:\n%s", want, body)
-		}
+	text, events, delta := bridgeStreamSummary(t, body)
+	if text != "a short note" { // the already-streamed first answer, never the speculative narration
+		t.Errorf("rescued text = %q, want only first sample", text)
+	}
+	if events["content_block_start"] != 2 || events["message_start"] != 1 ||
+		events["message_delta"] != 1 || events["message_stop"] != 1 {
+		t.Errorf("rescued event counts = %v:\n%s", events, body)
+	}
+	if !strings.Contains(body, `"type":"tool_use"`) || !strings.Contains(body, `"name":"get_time"`) {
+		t.Errorf("rescued stream missing tool_use:\n%s", body)
+	}
+	stop := delta["delta"].(map[string]any)
+	usage := delta["usage"].(map[string]any)
+	if stop["stop_reason"] != "tool_use" || usage["output_tokens"] != float64(8) {
+		t.Errorf("rescued stop/usage = %v / %v, want tool_use / second sample's 8 tokens", stop, usage)
 	}
 }
 
@@ -261,11 +299,108 @@ func TestBridgeToollessResampleGivesUpWhenStillToolless(t *testing.T) {
 		t.Fatalf("upstream hits = %d, want 2 (original + one resample, then give up)", hits)
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, `"stop_reason":"end_turn"`) {
-		t.Errorf("want end_turn after failed resample:\n%s", body)
+	text, events, delta := bridgeStreamSummary(t, body)
+	if text != "a short note" {
+		t.Errorf("text = %q, want first sample once (no speculative duplication)", text)
+	}
+	if events["content_block_start"] != 1 || events["message_start"] != 1 ||
+		events["message_delta"] != 1 || events["message_stop"] != 1 || events["error"] != 0 {
+		t.Errorf("event counts = %v:\n%s", events, body)
+	}
+	stop := delta["delta"].(map[string]any)
+	usage := delta["usage"].(map[string]any)
+	if stop["stop_reason"] != "end_turn" || usage["output_tokens"] != float64(9) {
+		t.Errorf("stop/usage = %v / %v, want end_turn / first sample's 9 tokens", stop, usage)
 	}
 	if strings.Contains(body, `"type":"tool_use"`) {
 		t.Errorf("no tool_use expected:\n%s", body)
+	}
+}
+
+func TestBridgeToollessResampleRejectsSpeculativeTextAndFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		second [][2]string
+	}{
+		{"still toolless", [][2]string{
+			{"response.output_text.delta", `{"item_id":"a","delta":"different second text"}`},
+			{"response.completed", `{"response":{"status":"completed","usage":{"input_tokens":20,"output_tokens":99}}}`},
+		}},
+		{"tool then failed", append(toolFrames(), [2]string{"response.failed", `{"response":{"error":"resample failed"}}`})},
+		{"tool then incomplete", append(toolFrames(), [2]string{"response.incomplete", `{"response":{"usage":{"input_tokens":20,"output_tokens":99}}}`})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits := 0
+			zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits++
+				w.Header().Set("Content-Type", "text/event-stream")
+				frames := textOnlyFrames()
+				if hits == 2 {
+					frames = tc.second
+				}
+				for _, f := range frames {
+					fmt.Fprintf(w, "event: %s\ndata: %s\n\n", f[0], f[1])
+				}
+			}))
+			defer zen.Close()
+			srv := responsesBridgeTestServer(t, zen.URL)
+			srv.cfg.BridgeToollessResample = true
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(bridgeAnthropicBody(t, true)))
+			srv.Proxy().ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK || hits != 2 {
+				t.Fatalf("status=%d hits=%d body=%s", rec.Code, hits, rec.Body.String())
+			}
+			text, events, delta := bridgeStreamSummary(t, rec.Body.String())
+			if text != "a short note" || events["message_stop"] != 1 || events["message_delta"] != 1 ||
+				events["content_block_start"] != 1 || events["error"] != 0 ||
+				delta["delta"].(map[string]any)["stop_reason"] != "end_turn" ||
+				delta["usage"].(map[string]any)["output_tokens"] != float64(9) {
+				t.Errorf("failed speculative sample changed original: text=%q events=%v delta=%v\n%s", text, events, delta, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestBridgeToollessResampleUsesSecondTextIfFirstEmpty(t *testing.T) {
+	hits := 0
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		frames := [][2]string{
+			{"response.output_item.added", `{"item_id":"b","item":{"type":"reasoning"}}`},
+			{"response.completed", `{"response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":0}}}`},
+		}
+		if hits == 2 {
+			// Reuse b to prove the speculative call doesn't collide with the
+			// first sample's non-tool output item.
+			frames = [][2]string{
+				{"response.output_text.delta", `{"item_id":"a","delta":"calling it"}`},
+				{"response.output_item.added", `{"item_id":"b","item":{"type":"function_call","call_id":"call_9","name":"get_time"}}`},
+				{"response.output_item.done", `{"item_id":"b","item":{"type":"function_call","call_id":"call_9","name":"get_time","arguments":"{}"}}`},
+				{"response.completed", `{"response":{"status":"completed","usage":{"input_tokens":10,"output_tokens":8}}}`},
+			}
+		}
+		for _, f := range frames {
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", f[0], f[1])
+		}
+	}))
+	defer zen.Close()
+	srv := responsesBridgeTestServer(t, zen.URL)
+	srv.cfg.BridgeToollessResample = true
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(bridgeAnthropicBody(t, true)))
+	srv.Proxy().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || hits != 2 {
+		t.Fatalf("status=%d hits=%d body=%s", rec.Code, hits, rec.Body.String())
+	}
+	text, events, delta := bridgeStreamSummary(t, rec.Body.String())
+	if text != "calling it" || events["message_stop"] != 1 || events["message_delta"] != 1 ||
+		events["content_block_start"] != 2 ||
+		delta["delta"].(map[string]any)["stop_reason"] != "tool_use" ||
+		delta["usage"].(map[string]any)["output_tokens"] != float64(8) ||
+		!strings.Contains(rec.Body.String(), `"type":"tool_use"`) {
+		t.Errorf("unexpected rescue: text=%q events=%v delta=%v\n%s", text, events, delta, rec.Body.String())
 	}
 }
 

@@ -128,7 +128,10 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		}
 
 		httpClient := s.upstreamClient(upstreamStream, cfg.RequestTimeoutSeconds)
-		resp, err := httpClient.Do(upReq)
+		// One-shot stall/5xx retry: a Zen stall within the 30s header bound
+		// otherwise surfaces to the client as a hard 502. Safe because nothing
+		// is written downstream yet and the POST has no side effects.
+		resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
@@ -206,7 +209,8 @@ func (s *Server) proxyResponsesViaAnthropic(
 	}
 
 	httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
-	resp, err := httpClient.Do(upReq)
+	// Same one-shot stall/5xx retry as the Responses->Chat path above.
+	resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 		s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,

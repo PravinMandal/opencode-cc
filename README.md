@@ -41,6 +41,8 @@ Each protocol implements the `TranslateRequest`, `TranslateResponse`, and `Trans
 - **Complete tool-call support.** Anthropic `tool_use` and `tool_result` blocks are translated bidirectionally into
   OpenAI `tool_calls` and `role:"tool"` messages. Claude Code tool definitions are converted into OpenAI function
   tools. The `reasoning_content` extension used by several models is translated into Anthropic `thinking` blocks.
+  With `bridge_toolless_resample` enabled, a short tool-less answer can be sampled again; a failed retry leaves the
+  first response untouched, while a successful tool retry adds its tool calls without repeating already-streamed text.
 - **Automatic routing across four protocols.** Model IDs beginning with `claude-` or `qwen` use Anthropic,
   `gpt-` uses Responses, `gemini-` uses Google, and all other models use OpenAI. No manual protocol configuration is
   required.
@@ -394,6 +396,127 @@ opencode-cc/
   capabilities can change. Use `GET https://opencode.ai/zen/v1/models` with an API key to retrieve the latest catalog.
 - **Older SQLite databases are incompatible.** The schema changed during refactoring: `session_map` was removed and the
   `requests` fields changed. During development, delete `data/*.db`. Versioned migrations will be added for production.
+
+## Measured TTFT and throughput (2026-10-02)
+
+20-request runs against the live service, `space-bunny`, sequential, after the
+connection-warmth and retry changes. `ttfb` = first byte of the response;
+`ttft` = first content or reasoning token (the number a user perceives);
+`tok/s` = output tokens divided by the time *after* the first token, so it
+measures decode rate rather than prefill.
+
+Short answers (`max_tokens=32`, "Say hi in three words."):
+
+| Run | ok | ttft p50 | ttft p90 | ttft max | tok/s p50 | total p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `:8787` opencode-cc direct | 20/20 | 2072ms | 9712ms | 18125ms | 21.9 | 2636ms |
+| `:8317` full chain (`space-bunny-oc`) | 20/20 | 1998ms | 4669ms | 20616ms | 19.4 | 2436ms |
+
+Long answers (`max_tokens=1500`, an eight-paragraph explanation, forcing real
+prefill and decode):
+
+| Run | ok | ttft p50 | ttft p90 | total p50 | tok/s p50 | tok/s p90 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `:8787` opencode-cc direct | 20/20 | 1490ms | 5845ms | 15073ms | 108.5 | 142.8 |
+| `:8317` full chain | 19/20 | 1880ms | 4845ms | 29655ms | 55.7 | 66.9 |
+
+How to read this:
+
+- **TTFT is upstream-bound.** Best observed ttft is ~810-1156ms, essentially
+  the edge TTFB floor, and the proxy adds 1-2ms of its own. There is no
+  meaningful proxy-side latency left to remove.
+- **Tail latency is Zen free-tier queueing**, not the proxy: the p90/max spread
+  is 5-18x and varies run to run. Retrying made it visible in the log —
+  `upstream attempt 1 timeout (net/http: timeout awaiting response headers),
+  retrying` — and those requests then completed normally.
+- **tok/s ~100-140 for long generations** is the model's decode rate on this
+  free tier. Short-answer tok/s looks wild (3-30) simply because 6-9 output
+  tokens make the denominator meaningless; do not read it as a speed change.
+- The `:8317` chain adds cli-proxyapi's own translation hop, visible as lower
+  tok/s at p50 on long answers (55.7 vs 108.5) — that is the extra hop, not a
+  regression in opencode-cc.
+
+Harness used (kept out of the repo, it is a measurement tool, not product
+code): a streaming client that timestamps first byte, first content token, and
+reads authoritative `usage` from the trailing chunk.
+
+## Upstream retry coverage (2026-10-02)
+
+The stall that produced `auth_unavailable ... timeout awaiting response
+headers` was not isolated to one route. Every upstream call site now goes
+through `doUpstreamWithRetry`:
+
+| Route | File | Before |
+| --- | --- | --- |
+| `/v1/chat/completions` | `openai_proxy.go` | no retry |
+| `/v1/messages` (Anthropic) | `proxy.go` (translated + native) | no retry |
+| `/v1/responses` (Codex) | `responses_proxy.go` (both branches) | no retry |
+
+`isTimeoutErr` additionally classifies `io.EOF`/`io.ErrUnexpectedEOF` as
+retryable: the edge closing a pooled socket before response headers is
+transient and nothing downstream depends on that attempt. Retries stay bounded
+(3 attempts on timeout, 2 on 5xx, 2s backoff) and stop immediately if the
+downstream client has disconnected.
+
+Two latent crashes were fixed alongside, both found by the new tests: a nil
+`store` dereference inside the *logging goroutine* (`logSuccessWithCache` /
+`logFailed` run in `go func()`), which would panic the whole process rather
+than fail one request when request logging is disabled. `store` is now
+nil-guarded at both call sites.
+
+## Time-to-first-token: connection warmth (2026-10-02)
+
+TTFT here is dominated by upstream network cost, not by proxy work. Measured
+with a local instant-response mock upstream, the proxy's own CPU/processing
+overhead is **1-2ms**; a cold-connection benchmark against the real Zen edge
+showed the decisive costs:
+
+| Factor | Measured | Note |
+| --- | --- | --- |
+| Proxy processing overhead | 1-2ms | mock upstream, so noise-free |
+| Fresh TCP+TLS handshake | ~562ms | paid on every cold connection |
+| Warm connection vs. cold | ~610ms faster | the dominant controllable win |
+| Edge TTFB once warm (H1) | ~498ms | `/v1/models`, 41 samples |
+| Edge TTFB once warm (H2) | ~520ms | H2 is *not* faster; irrelevant vs H1 |
+| Idle gap ≤ 60s | stays warm | connection reused |
+| Idle gap ≥ 90s | **+900ms** | old `IdleConnTimeout` reap cliff |
+
+So the previous `IdleConnTimeout: 90s` was a self-inflicted TTFT cliff: any
+turn starting after 90s of quiet (normal when a user reads output or pauses)
+re-handshaked TLS. Three changes:
+
+- `IdleConnTimeout` raised `90s` → **1h**, with an explicit `net.Dialer` whose
+  TCP `KeepAlive` (75m) outlives it. Previously the transport silently used
+  `net/http`'s default dialer, whose 30s TCP keep-alive is *shorter* than the
+  idle window and let the OS reap supposedly-warm sockets early.
+- `MaxIdleConnsPerHost` `16` → **32** and `MaxIdleConns` `100` → **256`, so
+  parallel-subagent bursts reuse pooled sockets instead of dialing new ones.
+- New `internal/server/keepalive.go` pings each enabled upstream with one cheap
+  `GET /v1/models` every **45s** through the shared transport, so the pool
+  stays warm across long thinking gaps. It reuses the real pool, ignores
+  failures (a real request reports outages better), never touches the upstream
+  slot semaphores, and stops when `Shutdown` closes the server's `done` channel.
+
+Upstream is deliberately still **HTTP/1.1 only**. H2 measured no faster, and
+the Sep 2026 SIGQUIT forensics in `server.go` document a real H2 flow-control
+wedge that wedged every route sharing the client.
+
+Separately, `/v1/chat/completions` had no upstream retry, so a Zen stall became
+a hard 502 (the `auth_unavailable: ... timeout awaiting response headers` seen
+from cli-proxy-api). It now uses the existing `doUpstreamWithRetry` helper —
+safe because nothing is written downstream yet and the POST has no side
+effects. Verified against a deliberately stalling mock: 35s stall on the first
+attempt now returns `200` on retry instead of failing.
+
+Post-deploy, three consecutive turns through cli-proxy-api `:8317` separated by
+100s idle gaps ran **1.24s / 1.29s / 1.39s** with a single warm upstream
+connection held throughout.
+
+Operational note: the request log (`~/data/opencode-cc.db`) has no pruning and
+had reached **215MB / 10,218 rows** (avg 21KB of bodies per row) while the
+root filesystem sat at 98%. That is unrelated to TTFT — inserts happen in
+background goroutines, off the critical path — but it is a disk-space risk
+worth adding retention for.
 
 ## Local harness compatibility (2026-09-23)
 

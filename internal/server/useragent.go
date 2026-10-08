@@ -8,7 +8,19 @@ import (
 )
 
 const (
-	fallbackOCVersion = "2.0.12"
+	// fallbackOCVersion is used only when no installed opencode binary reports
+	// a stable version (missing binary, probe failure, or a prerelease-only
+	// install). Kept current with the installed release so a broken probe
+	// still sends a plausible version to Zen's free-tier gate, which validates
+	// the semver shape.
+	//
+	// Runtime detection is preferred and is what normally runs: detectOCVersion
+	// probes `/usr/bin/opencode`, `opencode1`, then `opencode` with
+	// `--version` and takes the first stable semver, so upgrading opencode
+	// needs no code change here. Verified on 2026-10-02 to emit
+	// `opencode/latest/2.0.22/cli` for an installed v2.0.22; only this
+	// fallback constant needed bumping.
+	fallbackOCVersion = "2.0.22"
 	// The current OpenCode installation format is
 	// opencode/<channel>/<version>/<client>. Zen's free-tier gate validates
 	// this shape, so do not append the old AI SDK suffix here.

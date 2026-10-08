@@ -5,6 +5,7 @@ package server
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -214,11 +215,19 @@ func isTimeoutErr(err error) bool {
 	if te, ok := err.(interface{ Timeout() bool }); ok && te.Timeout() {
 		return true
 	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		// Upstream closed before sending response headers (edge restart, or a
+		// pooled socket reaped by the peer between selection and write). No
+		// bytes were received, so nothing downstream depends on this attempt
+		// and a retry is safe and cheap.
+		return true
+	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "timeout awaiting response headers") ||
 		strings.Contains(msg, "context deadline exceeded") ||
 		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe")
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "eof")
 }
 
 func truncateErr(s string) string {

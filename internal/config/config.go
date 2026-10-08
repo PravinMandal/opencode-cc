@@ -133,8 +133,11 @@ type Config struct {
 	// completed turn declares tools but returns none (weak-model sampler
 	// flake: narration instead of a tool call). The resample is identical
 	// and only fires on short (<=500 output tokens) completed turns; if it
-	// yields tools they are appended, otherwise the original stands. This
-	// trades one extra upstream call on tool-less turns for agent loops
+	// yields usable tools only those tools are appended (without repeating
+	// already-streamed text); otherwise the original text and usage stand.
+	// Chat streams with already-emitted thinking are not resampled because
+	// their reasoning cannot be paired with a different sample's tool calls.
+	// This trades one extra upstream call on tool-less turns for agent loops
 	// that stall on text-only end_turns. Default false.
 	BridgeToollessResample bool `json:"bridge_toolless_resample"`
 	// ThinkingBudgetMappings are evaluated by target model. They translate

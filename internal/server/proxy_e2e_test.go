@@ -97,6 +97,84 @@ func TestChatToollessResampleRescuesEmptyStream(t *testing.T) {
 	}
 }
 
+// A completed tool-less sample may have already streamed its greeting before
+// the speculative retry starts. The second sample must not append another
+// greeting, regardless of whether it rescues a tool call.
+func TestChatToollessResampleDoesNotRepeatText(t *testing.T) {
+	for _, rescue := range []bool{false, true} {
+		t.Run(fmt.Sprintf("rescue=%t", rescue), func(t *testing.T) {
+			hits := 0
+			zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits++
+				w.Header().Set("Content-Type", "text/event-stream")
+				text := "first greeting"
+				if hits == 2 {
+					text = "second greeting"
+				}
+				fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"content\":%q}}]}\n\n", text)
+				if hits == 2 && rescue {
+					fmt.Fprint(w, `data: {"choices":[{"delta":{"reasoning_content":"second reasoning"}}]}`+"\n\n")
+					fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_2","function":{"name":"Bash","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\n")
+				} else {
+					fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`+"\n\n")
+				}
+				fmt.Fprintf(w, "data: {\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":%d}}\n\n", hits)
+				fmt.Fprint(w, "data: [DONE]\n\n")
+			}))
+			defer zen.Close()
+			cfg := config.Default()
+			cfg.UpstreamBase, cfg.ZenAPIKey = zen.URL, "test-key"
+			cfg.BridgeToollessResample = true
+			srv, _ := newTestServerWithCfg(t, cfg)
+			rec := httptest.NewRecorder()
+			srv.Proxy().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(chatLoopBody(t))))
+			if rec.Code != http.StatusOK || hits != 2 {
+				t.Fatalf("status=%d hits=%d body=%s", rec.Code, hits, rec.Body.String())
+			}
+			body := rec.Body.String()
+			if strings.Count(body, `"text":"first greeting"`) != 1 || strings.Contains(body, `"text":"second greeting"`) {
+				t.Errorf("resample text leaked into streamed answer: %s", body)
+			}
+			if strings.Count(body, "event: message_stop") != 1 {
+				t.Errorf("want one terminal event: %s", body)
+			}
+			if rescue {
+				if !strings.Contains(body, `"stop_reason":"tool_use"`) || !strings.Contains(body, `"name":"Bash"`) ||
+					!strings.Contains(body, `"output_tokens":2`) || strings.Count(body, `"thinking":"second reasoning"`) != 1 {
+					t.Errorf("missing rescued tool, reasoning or usage: %s", body)
+				}
+			} else if !strings.Contains(body, `"stop_reason":"end_turn"`) || !strings.Contains(body, `"output_tokens":1`) {
+				t.Errorf("original verdict/usage was lost: %s", body)
+			}
+		})
+	}
+}
+
+// A first sample's already-streamed thinking cannot be undone or paired
+// with a different sample's tool call in the next-turn reasoning history.
+func TestChatToollessResampleKeepsOriginalThinking(t *testing.T) {
+	hits := 0
+	zen := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"reasoning_content":"first reasoning","content":"first greeting"},"finish_reason":"stop"}]}`+"\n\n")
+		fmt.Fprint(w, `data: {"usage":{"prompt_tokens":10,"completion_tokens":2}}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer zen.Close()
+	cfg := config.Default()
+	cfg.UpstreamBase, cfg.ZenAPIKey = zen.URL, "test-key"
+	cfg.BridgeToollessResample = true
+	srv, _ := newTestServerWithCfg(t, cfg)
+	rec := httptest.NewRecorder()
+	srv.Proxy().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/v1/messages", bytes.NewReader(chatLoopBody(t))))
+	body := rec.Body.String()
+	if rec.Code != http.StatusOK || hits != 1 || !strings.Contains(body, `"thinking":"first reasoning"`) ||
+		strings.Count(body, `"text":"first greeting"`) != 1 || !strings.Contains(body, `"stop_reason":"end_turn"`) {
+		t.Errorf("unsafe thinking retry: status=%d hits=%d body=%s", rec.Code, hits, body)
+	}
+}
+
 func TestChatToollessResampleDisabled(t *testing.T) {
 	hits := 0
 	zen := flakyChatZen(t, &hits)

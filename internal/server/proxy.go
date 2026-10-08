@@ -136,7 +136,13 @@ func (s *Server) Proxy() http.HandlerFunc {
 
 		httpClient := s.upstreamClient(upstreamStream, timeoutSeconds)
 
-		resp, err := httpClient.Do(upReq)
+		// Retry a stalled/5xx upstream once. Zen free-tier intermittently
+		// stalls >30s awaiting response headers and 503s under concurrency;
+		// without this the client sees a hard 502 (observed Oct 2026 as
+		// cli-proxyapi "auth_unavailable ... timeout awaiting response
+		// headers"). Safe here: nothing has been written downstream yet and
+		// the upstream POST has no side effects.
+		resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
 		if err != nil {
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
@@ -211,7 +217,10 @@ func (s *Server) proxyNativeAnthropic(
 	}
 
 	httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
-	resp, err := httpClient.Do(upReq)
+	// Same one-shot stall/5xx retry as the translated chat path: Zen's free
+	// tier intermittently never returns response headers within the 30s
+	// bound, and this path had no recovery at all.
+	resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 		s.logFailed(r.Context(), r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
@@ -533,6 +542,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	conv.RestrictTools(anthropicToolNamesFromBody(reqBody))
 	conv.SetDeclaredSchemas(areqToolsFromBody(reqBody))
 	declaredTools := anthropicToolNamesFromBody(reqBody)
+	declaredSchemas := areqToolsFromBody(reqBody)
 
 	// Read the upstream body, transparently decompressing gzip if needed.
 	bodyReader := io.Reader(resp.Body)
@@ -566,7 +576,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 	// first try the aborted-stream resample (strict guards: no tool content
 	// may exist yet); only then surface the error event.
 	if streamErr != nil && streamErr.Error() != "EOF" {
-		if s.maybeResampleAbortedChatStream(r, flusher, conv, resample, resampleEnabled, declaredTools, &inputTok, &outputTok, &cachedInputTok, &malformed, streamErr, inModel, target) {
+		if s.maybeResampleAbortedChatStream(r, flusher, conv, resample, resampleEnabled, declaredTools, declaredSchemas, &inputTok, &outputTok, &cachedInputTok, &malformed, streamErr, inModel, target) {
 			// Rescued: fall through to Finalize, which emits tool_use.
 		} else {
 			_ = conv.EmitError("api_error", "upstream stream error: "+streamErr.Error())
@@ -578,7 +588,7 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 			return
 		}
 	}
-	s.maybeResampleToollessChatStream(r, flusher, conv, resample, resampleEnabled, declaredTools, &inputTok, &outputTok, &cachedInputTok, &malformed, inModel, target)
+	s.maybeResampleToollessChatStream(r, flusher, conv, resample, resampleEnabled, declaredTools, declaredSchemas, &inputTok, &outputTok, &cachedInputTok, &malformed, inModel, target)
 	_ = conv.Finalize("end_turn")
 	stopReason = conv.StopReason()
 	_ = conv.Flush()
@@ -612,12 +622,9 @@ func (s *Server) handleStreamResponse(w http.ResponseWriter, resp *http.Response
 }
 
 // maybeResampleToollessChatStream retries a completed tool-less Chat turn
-// once against the identical upstream request, scanning the second sample
-// into the same still-open converter (buffered tools emit once at Finalize,
-// so ordering stays valid). Returns true only on rescue. Must run before
-// Finalize. A resample that ends length-truncated without tools can
-// relabel the stop max_tokens; that mislabel is benign (the client
-// continues itself) and is noted here so it never confuses forensics.
+// once against the identical upstream request. The speculative sample is
+// isolated until it contains a usable tool call; the first sample may already
+// have streamed text to the client and cannot be rolled back.
 func (s *Server) maybeResampleToollessChatStream(
 	r *http.Request,
 	flusher http.Flusher,
@@ -625,6 +632,7 @@ func (s *Server) maybeResampleToollessChatStream(
 	resample func() (*http.Response, error),
 	enabled bool,
 	declaredTools []string,
+	declaredSchemas []proxy.AnthropicTool,
 	inputTok, outputTok, cachedInputTok *int,
 	malformed *int,
 	inModel, target string,
@@ -637,12 +645,15 @@ func (s *Server) maybeResampleToollessChatStream(
 	do, verdict := proxy.ShouldResampleToolless(enabled, len(declaredTools),
 		"end_turn", conv.HasToolUse(), len(conv.DroppedCalls()),
 		*outputTok, upstreamStatus)
-	if !do {
+	// A streamed thinking block belongs to the first upstream sample. If a
+	// retry won, Claude Code would replay that unrelated reasoning with the
+	// rescued call; there is no way to retract it from the open SSE message.
+	if !do || conv.HasReasoning() {
 		return false
 	}
 	log.Printf("opencode-cc: toolless resample [chat] (%s) out=%d upstream_finish=%q model=%s target=%s",
 		verdict, *outputTok, finish, inModel, target)
-	return s.runChatResample(r, flusher, conv, resample, inputTok, outputTok, cachedInputTok, malformed, inModel, target)
+	return s.runChatResample(r, flusher, conv, resample, declaredTools, declaredSchemas, inputTok, outputTok, cachedInputTok, malformed, inModel, target)
 }
 
 // maybeResampleAbortedChatStream retries a mid-stream aborted Chat turn
@@ -657,27 +668,31 @@ func (s *Server) maybeResampleAbortedChatStream(
 	resample func() (*http.Response, error),
 	enabled bool,
 	declaredTools []string,
+	declaredSchemas []proxy.AnthropicTool,
 	inputTok, outputTok, cachedInputTok *int,
 	malformed *int,
 	scanErr error,
 	inModel, target string,
 ) bool {
 	if !enabled || len(declaredTools) == 0 || conv.HasToolUse() || conv.HasBufferedTools() ||
-		len(conv.DroppedCalls()) != 0 || *outputTok > proxy.ToollessResampleMaxOutputTokens {
+		conv.HasReasoning() || len(conv.DroppedCalls()) != 0 || *outputTok > proxy.ToollessResampleMaxOutputTokens {
 		return false
 	}
 	log.Printf("opencode-cc: aborted-stream resample [chat] (%v) out=%d model=%s target=%s",
 		scanErr, *outputTok, inModel, target)
-	return s.runChatResample(r, flusher, conv, resample, inputTok, outputTok, cachedInputTok, malformed, inModel, target)
+	return s.runChatResample(r, flusher, conv, resample, declaredTools, declaredSchemas, inputTok, outputTok, cachedInputTok, malformed, inModel, target)
 }
 
-// runChatResample POSTs once via resample and scans the result into the
-// still-open converter. True only when the sample yields tool calls.
+// runChatResample validates a speculative response in a separate converter.
+// Only a successful tool rescue is replayed into the open downstream message;
+// a tool-less/error response never changes the first sample's text or usage.
 func (s *Server) runChatResample(
 	r *http.Request,
 	flusher http.Flusher,
 	conv *proxy.StreamConverter,
 	resample func() (*http.Response, error),
+	declaredTools []string,
+	declaredSchemas []proxy.AnthropicTool,
 	inputTok, outputTok, cachedInputTok *int,
 	malformed *int,
 	inModel, target string,
@@ -706,30 +721,60 @@ func (s *Server) runChatResample(
 		defer gz.Close()
 		reader = gz
 	}
+	// Never scan directly into conv: text deltas would already be delivered
+	// before we know whether this retry has actually rescued anything.
+	candidate, err := proxy.NewStreamConverter(io.Discard, inModel, nil)
+	if err != nil {
+		return false
+	}
+	candidate.RestrictTools(declaredTools)
+	candidate.SetDeclaredSchemas(declaredSchemas)
+	var chunks []*proxy.OpenAIStreamChunk
+	var bufferedBytes int
 	scanRes, scanErr := proxy.ScanOpenAIStreamWithStatus(reader, func(chunk *proxy.OpenAIStreamChunk) error {
-		if chunk.Usage != nil {
-			*inputTok = chunk.Usage.PromptTokens
-			*outputTok = chunk.Usage.CompletionTokens
-			*cachedInputTok = chunk.Usage.CachedPromptTokens()
+		encoded, err := json.Marshal(chunk)
+		if err != nil {
+			return err
 		}
-		if herr := conv.HandleChunk(chunk); herr != nil {
-			return herr
+		bufferedBytes += len(encoded)
+		if bufferedBytes > 8<<20 {
+			return fmt.Errorf("resample exceeded 8 MiB buffer limit")
 		}
-		flusher.Flush()
-		return nil
+		chunks = append(chunks, chunk)
+		return candidate.HandleChunk(chunk)
 	})
-	*malformed += scanRes.Malformed
 	if scanErr != nil && scanErr.Error() != "EOF" {
 		log.Printf("opencode-cc: toolless resample [chat] stream error: %v model=%s target=%s",
 			scanErr, inModel, target)
 		return false
 	}
-	flusher.Flush()
-	if !conv.HasToolUse() {
+	if err := candidate.Finalize("end_turn"); err != nil || candidate.StopReason() != "tool_use" {
 		log.Printf("opencode-cc: toolless resample [chat] still toolless model=%s target=%s",
 			inModel, target)
 		return false
 	}
+	// The original text is already on the wire. Keep its narration and only
+	// append the newly rescued tool calls; if the first sample was empty,
+	// preserve the second sample's text as well.
+	keepText := conv.TextHead() == ""
+	for _, chunk := range chunks {
+		if !keepText {
+			for i := range chunk.Choices {
+				chunk.Choices[i].Delta.Content = ""
+			}
+		}
+		if chunk.Usage != nil {
+			*inputTok = chunk.Usage.PromptTokens
+			*outputTok = chunk.Usage.CompletionTokens
+			*cachedInputTok = chunk.Usage.CachedPromptTokens()
+		}
+		if err := conv.HandleChunk(chunk); err != nil {
+			log.Printf("opencode-cc: toolless resample [chat] replay error: %v model=%s target=%s", err, inModel, target)
+			return false
+		}
+		flusher.Flush()
+	}
+	*malformed += scanRes.Malformed
 	log.Printf("opencode-cc: toolless resample [chat] RESCUED model=%s target=%s",
 		inModel, target)
 	return true
@@ -789,27 +834,32 @@ func (s *Server) logSuccessWithCache(ctx context.Context, r *http.Request, inMod
 	if apiKey != nil {
 		keyID = apiKey.ID
 	}
-	go func() {
-		bg := context.Background()
-		_ = s.store.InsertRequest(bg, &store.RequestRow{
-			Ts:                       time.Now(),
-			Method:                   r.Method,
-			Path:                     r.URL.Path,
-			IncomingModel:            inModel,
-			TargetModel:              target,
-			Stream:                   stream,
-			Status:                   status,
-			DurationMs:               dur.Milliseconds(),
-			InputTokens:              inputTok,
-			OutputTokens:             outputTok,
-			CachedInputTokens:        cachedInputTok,
-			CacheCreationInputTokens: cacheCreationInputTok,
-			StopReason:               stopReason,
-			ReqBody:                  reqBody,
-			RespBody:                 respBody,
-			APIKeyID:                 keyID,
-		})
-	}()
+	// A nil store means request logging is disabled (dev/in-memory mode). This
+	// runs in a goroutine, so a nil dereference here would panic the whole
+	// process rather than fail the request.
+	if s.store != nil {
+		go func() {
+			bg := context.Background()
+			_ = s.store.InsertRequest(bg, &store.RequestRow{
+				Ts:                       time.Now(),
+				Method:                   r.Method,
+				Path:                     r.URL.Path,
+				IncomingModel:            inModel,
+				TargetModel:              target,
+				Stream:                   stream,
+				Status:                   status,
+				DurationMs:               dur.Milliseconds(),
+				InputTokens:              inputTok,
+				OutputTokens:             outputTok,
+				CachedInputTokens:        cachedInputTok,
+				CacheCreationInputTokens: cacheCreationInputTok,
+				StopReason:               stopReason,
+				ReqBody:                  reqBody,
+				RespBody:                 respBody,
+				APIKeyID:                 keyID,
+			})
+		}()
+	}
 	s.recordUsage(apiKey, inputTok+outputTok, 1)
 }
 
@@ -840,22 +890,26 @@ func (s *Server) logFailed(ctx context.Context, r *http.Request, inModel, target
 	if apiKey != nil {
 		keyID = apiKey.ID
 	}
-	go func() {
-		_ = s.store.InsertRequest(context.Background(), &store.RequestRow{
-			Ts:            time.Now(),
-			Method:        r.Method,
-			Path:          r.URL.Path,
-			IncomingModel: inModel,
-			TargetModel:   target,
-			Stream:        stream,
-			Status:        status,
-			DurationMs:    dur.Milliseconds(),
-			StopReason:    "error",
-			Error:         truncate(errMsg, 2048),
-			ReqBody:       reqStr,
-			APIKeyID:      keyID,
-		})
-	}()
+	// Guard the nil store: this is a background goroutine, so a nil
+	// dereference would crash the process instead of logging the failure.
+	if s.store != nil {
+		go func() {
+			_ = s.store.InsertRequest(context.Background(), &store.RequestRow{
+				Ts:            time.Now(),
+				Method:        r.Method,
+				Path:          r.URL.Path,
+				IncomingModel: inModel,
+				TargetModel:   target,
+				Stream:        stream,
+				Status:        status,
+				DurationMs:    dur.Milliseconds(),
+				StopReason:    "error",
+				Error:         truncate(errMsg, 2048),
+				ReqBody:       reqStr,
+				APIKeyID:      keyID,
+			})
+		}()
+	}
 }
 
 func (s *Server) shouldLog() bool {

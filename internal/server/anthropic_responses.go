@@ -13,6 +13,9 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"log"
@@ -363,12 +366,10 @@ func (s *Server) relayAnthropicResponsesJSON(
 		stop, string(reqBody), mustJSON(aresp), time.Since(start))
 }
 
-// maybeResampleToollessStream retries a completed tool-less bridge turn
-// once against the identical upstream request, scanning the second sample
-// into the same still-open converter. It returns true only when the
-// resample yields tool_use (the turn then finalizes tool_use); otherwise
-// the caller finalizes the original. Must run before Finalize: after
-// message_stop nothing more may be emitted downstream.
+// maybeResampleToollessStream tries one identical upstream request before the
+// original message is finalized. The candidate is scanned into a separate
+// converter and buffer: no speculative text, usage or errors reach the client.
+// Only a completed sample with a usable, declared tool call is committed.
 func (s *Server) maybeResampleToollessStream(
 	r *http.Request,
 	bw *bufio.Writer,
@@ -382,25 +383,15 @@ func (s *Server) maybeResampleToollessStream(
 	do, verdict := proxy.ShouldResampleToolless(enabled, len(areq.Tools),
 		"end_turn", conv.HasToolUse() || conv.HasPendingTools(), len(conv.DroppedCalls()),
 		conv.OutputTokens(), conv.CompletedStatus())
-	if !do {
+	if !do || conv.Failed() != "" || conv.Incomplete() {
 		return false
 	}
 	log.Printf("opencode-cc: toolless resample (%s) out=%d model=%s target=%s",
 		verdict, conv.OutputTokens(), incomingModel, targetModel)
-	// Snapshot speculative state: a failed resample must never corrupt
-	// the good first attempt (a recorded failure would flip Finalize
-	// into an error event; a spurious incomplete would mislabel the
-	// stop as max_tokens).
-	incompleteBefore := conv.Incomplete()
-	restore := func() {
-		conv.ClearFailed()
-		conv.SetIncomplete(incompleteBefore)
-	}
 	r2, err := resample()
 	if err != nil {
 		log.Printf("opencode-cc: toolless resample failed: %v model=%s target=%s",
 			err, incomingModel, targetModel)
-		restore()
 		return false
 	}
 	defer r2.Body.Close()
@@ -408,7 +399,6 @@ func (s *Server) maybeResampleToollessStream(
 		_, _ = io.Copy(io.Discard, io.LimitReader(r2.Body, 64*1024))
 		log.Printf("opencode-cc: toolless resample upstream %d model=%s target=%s",
 			r2.StatusCode, incomingModel, targetModel)
-		restore()
 		return false
 	}
 	reader := io.Reader(r2.Body)
@@ -417,39 +407,121 @@ func (s *Server) maybeResampleToollessStream(
 		if gerr != nil {
 			log.Printf("opencode-cc: toolless resample undecodable model=%s target=%s",
 				incomingModel, targetModel)
-			restore()
 			return false
 		}
 		defer gz.Close()
 		reader = gz
 	}
-	scanErr := scanAnthropicSSE(reader, func(event string, data []byte) error {
-		if herr := conv.HandleEvent(event, data); herr != nil {
-			return herr
+
+	// The candidate's emitted SSE is never sent downstream; keep only its
+	// state and the bounded upstream frames selected for replay below.
+	candidate := proxy.NewResponsesToAnthropicStreamer(bufio.NewWriter(io.Discard), incomingModel)
+	candidate.RestrictTools(anthropicToolNames(areq.Tools))
+	candidate.SetDeclaredSchemas(areq.Tools)
+	// Keep only frames that can contribute to a rescued turn. The first
+	// sample's text is already on the wire; use the second's text only if
+	// the first had none. Terminal usage comes from the selected sample.
+	includeText := conv.EmptyText()
+	type frame struct {
+		event string
+		data  []byte
+	}
+	var replay []frame
+	buffered := 0
+	limited := &io.LimitedReader{R: reader, N: maxResponseBytes + 1}
+	scanErr := scanAnthropicSSE(limited, func(event string, data []byte) error {
+		if err := candidate.HandleEvent(event, data); err != nil {
+			return err
 		}
-		if herr := bw.Flush(); herr != nil {
-			return herr
+		var meta struct {
+			Type string `json:"type"`
 		}
-		flusher.Flush()
+		if json.Unmarshal(data, &meta) != nil {
+			return nil // candidate already recorded the malformed frame
+		}
+		typ := meta.Type
+		if typ == "" {
+			typ = event
+		}
+		keep := typ == "response.completed" ||
+			strings.HasPrefix(typ, "response.function_call_arguments.") ||
+			typ == "response.output_item.added" || typ == "response.output_item.done" ||
+			(includeText && (typ == "response.output_text.delta" || typ == "response.output_text.done"))
+		if keep {
+			buffered += len(data)
+			if buffered > maxResponseBytes {
+				return errors.New("resample exceeded maximum buffered size")
+			}
+			replay = append(replay, frame{event, bytes.Clone(data)})
+		}
 		return nil
 	})
+	if limited.N == 0 {
+		scanErr = errors.New("resample exceeded maximum response size")
+	}
 	if scanErr != nil && !errors.Is(scanErr, io.EOF) {
 		log.Printf("opencode-cc: toolless resample stream error: %v model=%s target=%s",
 			scanErr, incomingModel, targetModel)
-		restore()
 		return false
+	}
+	if err := candidate.Finalize(); err != nil {
+		log.Printf("opencode-cc: toolless resample conversion error: %v model=%s target=%s",
+			err, incomingModel, targetModel)
+		return false
+	}
+	if candidate.Failed() != "" || candidate.Incomplete() || candidate.CompletedStatus() != "completed" || !candidate.HasToolUse() {
+		log.Printf("opencode-cc: toolless resample unusable status=%q failed=%v tools=%v frames=%s model=%s target=%s",
+			candidate.CompletedStatus(), candidate.Failed() != "", candidate.HasToolUse(), candidate.FrameCensus(), incomingModel, targetModel)
+		return false
+	}
+
+	// A first sample can have pending non-tool output items with the same
+	// item_id as a second sample's function call. Namespace the replayed
+	// IDs so flushTool cannot mistake one attempt's item for the other's.
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		log.Printf("opencode-cc: toolless resample ID generation failed: %v model=%s target=%s", err, incomingModel, targetModel)
+		return false
+	}
+	prefix := "resample_" + hex.EncodeToString(nonce[:]) + "_"
+	// Prepare every replay frame before touching the live converter. A bad
+	// frame must not leave even a partially replayed speculative sample.
+	for i := range replay {
+		f := &replay[i]
+		var meta struct {
+			Type string `json:"type"`
+		}
+		_ = json.Unmarshal(f.data, &meta) // parsed during scan
+		typ := meta.Type
+		if typ == "" {
+			typ = f.event
+		}
+		if strings.HasPrefix(typ, "response.function_call_arguments.") ||
+			typ == "response.output_item.added" || typ == "response.output_item.done" {
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(f.data, &fields); err != nil {
+				return false
+			}
+			var id string
+			_ = json.Unmarshal(fields["item_id"], &id)
+			fields["item_id"], err = json.Marshal(prefix + id)
+			if err != nil {
+				return false
+			}
+			f.data, err = json.Marshal(fields)
+			if err != nil {
+				return false
+			}
+		}
+	}
+	for _, f := range replay {
+		if err := conv.HandleEvent(f.event, f.data); err != nil {
+			log.Printf("opencode-cc: toolless resample replay error: %v model=%s target=%s", err, incomingModel, targetModel)
+			return false
+		}
 	}
 	_ = bw.Flush()
 	flusher.Flush()
-	if !conv.HasToolUse() && !conv.HasPendingTools() {
-		log.Printf("opencode-cc: toolless resample still toolless model=%s target=%s",
-			incomingModel, targetModel)
-		restore()
-		return false
-	}
-	// Rescued: a failure flag from the speculative sample must not flip
-	// Finalize into an error event (the tools are real; HasToolUse wins).
-	conv.ClearFailed()
 	log.Printf("opencode-cc: toolless resample RESCUED model=%s target=%s",
 		incomingModel, targetModel)
 	return true
@@ -531,14 +603,11 @@ func (s *Server) relayAnthropicResponsesStream(
 			http.StatusBadGateway, scanErr.Error(), reqBody, time.Since(start))
 		return
 	}
-	// Toolless resample: the first attempt is fully converted but NOT yet
-	// finalized (no message_delta/message_stop on the wire), so a rescued
-	// second sample appends its text + tool blocks into the same open
-	// message and the turn ends tool_use. When the resample is skipped or
-	// still tool-less, Finalize runs exactly once below as before.
-	if s.maybeResampleToollessStream(r, bw, flusher, conv, resample, resampleEnabled, areq, incomingModel, targetModel) {
-		// Rescued: usage now reflects the resample that produced the tools.
-	}
+	// The first sample's content has streamed, but message_stop has not.
+	// A usable resample contributes tool blocks and its usage; its text is
+	// included only when the first sample had no text. Otherwise the first
+	// sample remains untouched. Finalize emits the sole terminal events.
+	s.maybeResampleToollessStream(r, bw, flusher, conv, resample, resampleEnabled, areq, incomingModel, targetModel)
 	if err := conv.Finalize(); err != nil {
 		s.logFailed(r.Context(), r, incomingModel, targetModel, true,
 			http.StatusBadGateway, err.Error(), reqBody, time.Since(start))

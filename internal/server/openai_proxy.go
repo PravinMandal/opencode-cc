@@ -76,7 +76,12 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		}
 
 		httpClient := s.upstreamClient(upstreamStream, cfg.RequestTimeoutSeconds)
-		resp, err := httpClient.Do(upReq)
+		// Retry a stalled/5xx upstream once before failing. Zen free-tier
+		// intermittently stalls awaiting response headers (>30s) and 503s
+		// under concurrency; without this the client sees a hard 502
+		// (reported Oct 2026). Safe here because nothing has been written
+		// downstream yet and the POST has no side effects.
+		resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(r.Context(), r, incomingModel, targetModel, clientStream,

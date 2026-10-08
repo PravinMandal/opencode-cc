@@ -590,6 +590,10 @@ func (c *StreamConverter) DroppedCalls() []droppedCall {
 // for judging tool-less end_turn responses in the server log.
 func (c *StreamConverter) TextHead() string { return c.textHead.String() }
 
+// HasReasoning reports whether thinking from the first sample is already on
+// the wire. It cannot be retracted when a second sample wins the tool retry.
+func (c *StreamConverter) HasReasoning() bool { return c.reasoning.Len() > 0 }
+
 // mapFinishReason mirrors response.go but returns a pointer.
 func mapFinishReason(reason string) *string {
 	var s string

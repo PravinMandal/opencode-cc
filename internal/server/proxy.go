@@ -134,6 +134,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 		// Some upstreams prefer a UA.
 		upReq.Header.Set("User-Agent", ocUA())
 		setZenSessionHeadersWithSession(upReq, r.Header, session)
+		s.mergeConsoleHeaders(upReq, zenKey, upstream)
 		// Propagate the anthropic-version / anthropic-beta for observability
 		// on the upstream side (Zen ignores them for the OpenAI path).
 		if v := r.Header.Get("anthropic-version"); v != "" {
@@ -147,8 +148,10 @@ func (s *Server) Proxy() http.HandlerFunc {
 		// without this the client sees a hard 502 (observed Oct 2026 as
 		// cli-proxyapi "auth_unavailable ... timeout awaiting response
 		// headers"). Safe here: nothing has been written downstream yet and
-		// the upstream POST has no side effects.
-		resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+		// the upstream POST has no side effects. doFreeTierPost additionally
+		// fails over across Zen gateways on a FreeTierError 403 (see
+		// zenconfig.go) instead of giving up at the first gate.
+		resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/chat/completions")
 		if err != nil {
 			writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(ctx, r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))
@@ -208,6 +211,7 @@ func (s *Server) proxyNativeAnthropic(
 	upReq.Header.Set("x-api-key", zenKey)
 	upReq.Header.Set("User-Agent", ocUA())
 	setZenSessionHeaders(upReq, r.Header, stickyKey)
+	s.mergeConsoleHeaders(upReq, zenKey, upstream)
 	if areq.Stream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -225,8 +229,10 @@ func (s *Server) proxyNativeAnthropic(
 	httpClient := s.upstreamClient(areq.Stream, timeoutSeconds)
 	// Same one-shot stall/5xx retry as the translated chat path: Zen's free
 	// tier intermittently never returns response headers within the 30s
-	// bound, and this path had no recovery at all.
-	resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+	// bound, and this path had no recovery at all. doFreeTierPost adds
+	// cross-gateway failover on a FreeTierError 403 (free qwen/claude
+	// models ride this lane); paid-lane 403s pass through untouched.
+	resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/messages")
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 		s.logFailed(r.Context(), r, areq.Model, targetModel, areq.Stream, http.StatusBadGateway, err.Error(), body, time.Since(start))

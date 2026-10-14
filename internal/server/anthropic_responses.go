@@ -109,6 +109,7 @@ func (s *Server) proxyAnthropicViaResponses(
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
 	setZenSessionHeadersWithSession(upReq, r.Header, session)
+	s.mergeConsoleHeaders(upReq, zenKey, upstream)
 	if upstreamStream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -116,7 +117,7 @@ func (s *Server) proxyAnthropicViaResponses(
 	}
 
 	httpClient := s.upstreamClient(upstreamStream, timeoutSeconds)
-	resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+	resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/responses")
 	if err != nil {
 		logUpstreamError(r, incomingModel, targetModel, areq.Stream, time.Since(start), err)
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())

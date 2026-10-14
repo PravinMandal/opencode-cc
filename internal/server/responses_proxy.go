@@ -131,6 +131,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", ocUA())
 		setZenSessionHeadersWithSession(upReq, r.Header, session)
+		s.mergeConsoleHeaders(upReq, zenKey, upstream)
 		if upstreamStream {
 			upReq.Header.Set("Accept", "text/event-stream")
 		} else {
@@ -141,7 +142,7 @@ func (s *Server) ResponsesProxy() http.HandlerFunc {
 		// One-shot stall/5xx retry: a Zen stall within the 30s header bound
 		// otherwise surfaces to the client as a hard 502. Safe because nothing
 		// is written downstream yet and the POST has no side effects.
-		resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+		resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/chat/completions")
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,
@@ -204,6 +205,7 @@ func (s *Server) proxyResponsesViaAnthropic(
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
 	setZenSessionHeaders(upReq, r.Header, stickyKey)
+	s.mergeConsoleHeaders(upReq, zenKey, upstream)
 	if in.Stream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -219,8 +221,9 @@ func (s *Server) proxyResponsesViaAnthropic(
 	}
 
 	httpClient := s.upstreamClient(in.Stream, cfg.RequestTimeoutSeconds)
-	// Same one-shot stall/5xx retry as the Responses->Chat path above.
-	resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+	// Same one-shot stall/5xx retry as the Responses->Chat path above, plus
+	// cross-gateway failover on a FreeTierError 403 (see zenconfig.go).
+	resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/messages")
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 		s.logFailed(r.Context(), r, incomingModel, targetModel, in.Stream,

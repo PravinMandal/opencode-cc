@@ -92,6 +92,7 @@ func (s *Server) proxyResponsesPassthrough(
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
 	setZenSessionHeadersWithSession(upReq, r.Header, session)
+	s.mergeConsoleHeaders(upReq, zenKey, upstream)
 	if upstreamStream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -100,7 +101,7 @@ func (s *Server) proxyResponsesPassthrough(
 
 	upStart := time.Now()
 	httpClient := s.upstreamClient(upstreamStream, cfg.RequestTimeoutSeconds)
-	resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+	resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/responses")
 	if err != nil {
 		logUpstreamError(r, incomingModel, targetModel, in.Stream, time.Since(upStart), err)
 		writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())

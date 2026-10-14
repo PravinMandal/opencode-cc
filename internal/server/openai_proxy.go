@@ -80,6 +80,7 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", ocUA())
 		setZenSessionHeadersWithSession(upReq, r.Header, session)
+		s.mergeConsoleHeaders(upReq, zenKey, upstream)
 		if upstreamStream {
 			upReq.Header.Set("Accept", "text/event-stream")
 		} else {
@@ -92,7 +93,7 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		// under concurrency; without this the client sees a hard 502
 		// (reported Oct 2026). Safe here because nothing has been written
 		// downstream yet and the POST has no side effects.
-		resp, err := doUpstreamWithRetry(httpClient, upReq, upBody)
+		resp, err := s.doFreeTierPost(httpClient, upReq, upBody, zenKey, upstream, "/v1/chat/completions")
 		if err != nil {
 			writeOpenAIError(w, http.StatusBadGateway, "api_error", "upstream request failed: "+err.Error())
 			s.logFailed(r.Context(), r, incomingModel, targetModel, clientStream,

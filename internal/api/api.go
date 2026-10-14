@@ -96,6 +96,15 @@ func (a *API) Mount(mux *http.ServeMux) {
 // package (avoids an api → server import cycle). Called after key mutations.
 func SetInvalidateCache(fn func()) { invalidateCache = fn }
 
+// gateStatusFunc reports the free-tier gate watchdog counters
+// (total rejections, current consecutive streak); nil when unwired (tests).
+var gateStatusFunc func() (int64, int)
+
+// SetGateStatusFunc wires the gate watchdog reporter from the server
+// package, same pattern as SetInvalidateCache. Surfaced on /healthz so
+// monitoring can alert on gate changes without log scraping.
+func SetGateStatusFunc(fn func() (int64, int)) { gateStatusFunc = fn }
+
 // auth gates the panel API behind the configured panel token. If no token is
 // configured, access is open (convenient for localhost-only use).
 func (a *API) auth(next http.Handler) http.Handler {
@@ -152,11 +161,19 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 // health is an unauthenticated liveness probe.
 func (a *API) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"ok":      true,
 		"time":    time.Now().Format(time.RFC3339),
 		"version": "1.3.2",
-	})
+	}
+	// Free-tier gate watchdog: a nonzero streak means Zen is currently
+	// rejecting our free-lane requests (gate moved or key exhausted).
+	if gateStatusFunc != nil {
+		total, consec := gateStatusFunc()
+		body["free_tier_gate_rejections_total"] = total
+		body["free_tier_gate_rejections_consec"] = consec
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 // ---------------------------------------------------------------------------

@@ -333,8 +333,10 @@ func (s *Server) doOpenAIChat(
 	upReq.Header.Set("Accept", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
 	setZenSessionHeadersWithSession(upReq, down.Header, session)
+	s.mergeConsoleHeaders(upReq, zenKey, upstream)
 
-	resp, err := s.upstreamClient(stream, timeoutSeconds).Do(upReq)
+	// Stall retries + cross-gateway failover on FreeTierError (see zenconfig.go).
+	resp, err := s.doFreeTierPost(s.upstreamClient(stream, timeoutSeconds), upReq, upBody, zenKey, upstream, "/v1/chat/completions")
 	if err != nil {
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}

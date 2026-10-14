@@ -29,6 +29,17 @@ type Server struct {
 	keepAliveOnce sync.Once
 	// stopOnce guards closing done exactly once.
 	stopOnce sync.Once
+	// consoleRoutes caches per-key Zen console overlays (dynamic baseURL +
+	// headers, mirroring genuine opencode). See zenconfig.go.
+	consoleRoutes *consoleRouteCache
+	// consoleRefreshOnce guards the background console refresh loop.
+	consoleRefreshOnce sync.Once
+	// Gate watchdog: consecutive/total FreeTierError rejections. See
+	// zenconfig.go; surfaced on /healthz so monitoring can alert.
+	gateMu        sync.Mutex
+	gateConsec    int
+	gateTotal     int64
+	gateLastAlert time.Time
 }
 
 // New constructs a Server. The store may be nil if request logging is disabled.
@@ -38,10 +49,11 @@ func New(cfg *config.Config, st *store.Store) *Server {
 		dataDir = cfg.DataDir()
 	}
 	return &Server{
-		cfg:          cfg,
-		store:        st,
-		effortLevels: LoadEffortLevelsCache(dataDir),
-		done:         make(chan struct{}),
+		cfg:           cfg,
+		store:         st,
+		effortLevels:  LoadEffortLevelsCache(dataDir),
+		done:          make(chan struct{}),
+		consoleRoutes: newConsoleRouteCache(),
 		httpClient: &http.Client{
 			Timeout: 0, // streaming: no global timeout (per-request override used)
 			Transport: &http.Transport{
@@ -152,6 +164,9 @@ func (s *Server) Start(handler http.Handler) error {
 	// Hold upstream sockets warm so the first turn after an idle gap skips the
 	// ~610ms cold-connection handshake.
 	s.StartKeepAlive()
+	// Follow Zen's console config (routes/headers) like stock opencode, so
+	// endpoint migrations apply without a rebuild. See zenconfig.go.
+	s.startConsoleRefresh()
 	return s.srv.ListenAndServe()
 }
 
@@ -173,6 +188,7 @@ func (s *Server) Shutdown() error {
 // mountPanelAPI wires the panel's REST API onto mux via the api package.
 func (s *Server) mountPanelAPI(mux *http.ServeMux) {
 	api.SetInvalidateCache(InvalidateKeyCache)
+	api.SetGateStatusFunc(s.GateStatus)
 	api.New(s.cfg, s.store).Mount(mux)
 }
 

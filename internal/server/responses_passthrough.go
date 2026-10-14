@@ -60,6 +60,16 @@ func (s *Server) proxyResponsesPassthrough(
 	// pass through untouched.
 	upBody = s.clampPassthroughEffort(upBody, targetModel, incomingModel)
 
+	// Pair prompt_cache_key with the session header (Zen rejects mismatched
+	// pairs on the free-tier lane): one resolved session for both.
+	session := resolveUpstreamSession(r.Header, in.PromptCacheKey)
+	upBody, err = stampPromptCacheKey(upBody, session)
+	if err != nil {
+		writeOpenAIError(w, http.StatusInternalServerError, "api_error",
+			"could not prepare upstream Responses request: "+err.Error())
+		return
+	}
+
 	upURL := strings.TrimRight(upstream, "/") + "/v1/responses"
 
 	select {
@@ -81,7 +91,7 @@ func (s *Server) proxyResponsesPassthrough(
 	upReq.Header.Set("Authorization", "Bearer "+zenKey)
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
-	setZenSessionHeaders(upReq, r.Header, in.PromptCacheKey)
+	setZenSessionHeadersWithSession(upReq, r.Header, session)
 	if upstreamStream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {

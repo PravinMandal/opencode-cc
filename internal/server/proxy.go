@@ -92,6 +92,12 @@ func (s *Server) Proxy() http.HandlerFunc {
 			return
 		}
 
+		// Resolve ONE session for the upstream request and stamp it into both
+		// the body prompt_cache_key and the headers: Zen's free-tier gate
+		// rejects mismatched pairs (stock opencode always sends them equal).
+		session := resolveUpstreamSession(r.Header, stickyKey)
+		oreq.PromptCacheKey = session
+
 		// Marshal the upstream request.
 		upBody, err := json.Marshal(oreq)
 		if err != nil {
@@ -127,7 +133,7 @@ func (s *Server) Proxy() http.HandlerFunc {
 		}
 		// Some upstreams prefer a UA.
 		upReq.Header.Set("User-Agent", ocUA())
-		setZenSessionHeaders(upReq, r.Header, stickyKey)
+		setZenSessionHeadersWithSession(upReq, r.Header, session)
 		// Propagate the anthropic-version / anthropic-beta for observability
 		// on the upstream side (Zen ignores them for the OpenAI path).
 		if v := r.Header.Get("anthropic-version"); v != "" {

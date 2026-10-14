@@ -4,11 +4,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -29,22 +30,30 @@ import (
 //
 // Since ~2026-10-13 Zen additionally validates the session VALUE on the
 // free-tier lane (FreeTierError "can only be used from within OpenCode" when
-// it looks spoofed). Probed 2026-10-13 against the live gateway: the session
-// must have the genuine opencode Identifier shape ses_<12 hex><14 base62>
-// where the 12-hex prefix is the DESCENDING timestamp (~(ts_ms*0x1000+ctr),
-// schema/identifier.ts descending()). Fully random, all-hex (sha256), and
-// ascending-timestamp sessions are all rejected; a fresh descending session
-// and even a 24h-old one are accepted. The other session-carrying headers
-// (x-session-affinity, x-session-id), prompt_cache_key, tools, reasoning
-// effort, and TLS stack were all probed and are NOT validated. So every
-// synthesized session below reuses opencode's exact descending construction;
-// only the tail randomness source differs (hash-derived for stickiness).
+// it looks spoofed). Probed 2026-10-13/14 against the live gateway: the
+// session must have the genuine opencode Identifier shape ses_<12 hex><14
+// base62> where the 12-hex prefix is the DESCENDING timestamp
+// (~(ts_ms*0x1000+ctr), schema/identifier.ts descending()). Fully random,
+// all-hex (sha256), and ascending-timestamp sessions are rejected. Unknown
+// sessions must also be FRESH (2h-old passes, ~3.3h-old is rejected as of
+// 2026-10-14; previously-succeeded sessions appear exempt). Since 2026-10-14
+// Zen also rejects any request carrying x-opencode-request (which stock
+// opencode never sends — presence check) and any request whose shell/read
+// tools are missing or carry spoof marker text (genuine-shaped shell+read
+// required). The other session-carrying headers (x-session-affinity,
+// x-session-id), prompt_cache_key, reasoning effort, and TLS stack were all
+// probed and are NOT validated. Every synthesized value below reuses
+// opencode's exact constructions; only the randomness sources differ
+// (hash-derived for stickiness).
 //
 // This proxy must be indistinguishable from stock opencode upstream: it never
 // sends any opencode-cc fingerprint in these headers.
 const (
-	zenHeaderProject   = "x-opencode-project"
-	zenHeaderSession   = "x-opencode-session"
+	zenHeaderProject = "x-opencode-project"
+	zenHeaderSession = "x-opencode-session"
+	// zenHeaderRequest is intentionally never sent upstream (see
+	// setZenSessionHeaders): stock opencode omits it and Zen rejects any
+	// request carrying it. Kept as a named constant for documentation.
 	zenHeaderRequest   = "x-opencode-request"
 	zenHeaderClient    = "x-opencode-client"
 	zenHeaderAffinity  = "x-session-affinity"
@@ -64,12 +73,13 @@ var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{1
 // re-synthesized, never forwarded.
 var hexOnlySessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{26}$`)
 
-// sessionBucketMillis buckets synthesized session timestamps. Zen decodes
-// the descending prefix and accepts sessions at least 24h old (probed
-// 2026-10-13), so a 12h bucket keeps every emitted session well inside the
-// acceptance window while staying stable long enough for sticky routing and
-// provider prompt-cache to work.
-const sessionBucketMillis = int64(12 * 60 * 60 * 1000)
+// sessionBucketMillis buckets synthesized session timestamps. Zen gates
+// unknown sessions on prefix recency: 2h-old passes, ~3.3h-old is rejected
+// (probed live 2026-10-14; previously-succeeded sessions appear exempt).
+// A 30min bucket keeps every emitted session far inside the acceptance
+// window while staying stable long enough for sticky routing and provider
+// prompt-cache to work.
+const sessionBucketMillis = int64(30 * 60 * 1000)
 
 // sessionBucketStart returns the aligned bucket start (millis) for ts.
 func sessionBucketStart(tsMillis int64) int64 {
@@ -108,16 +118,16 @@ func canonicalSessionFromHash(sum [32]byte, tsMillis int64) string {
 }
 
 // maxDownstreamSessionAgeMs bounds how old a forwarded downstream session
-// may be. Zen's gate accepts sessions at least 24h old (probed live
-// 2026-10-13); anything older is re-synthesized deterministically (same
+// may be. Unknown sessions older than ~2h are rejected (probed live
+// 2026-10-14); anything older is re-synthesized deterministically (same
 // stickiness, guaranteed-fresh timestamp) rather than risk a FreeTierError
-// on a multi-day-old conversation id. The window is unknown beyond 24h, so
-// the threshold matches the evidence exactly.
-const maxDownstreamSessionAgeMs = int64(24 * 60 * 60 * 1000)
+// on a stale conversation id. The 1h threshold keeps a 2x margin under the
+// narrowest observed window.
+const maxDownstreamSessionAgeMs = int64(60 * 60 * 1000)
 
 // sessionPrefixAgeMs decodes the 12-hex descending prefix back to an age in
 // milliseconds, reduced mod 2^36 (the prefix only carries ts mod 2^36, which
-// wraps every ~2.2 years — still unambiguous against a 24h threshold).
+// wraps every ~2.2 years — still unambiguous against an hour-scale threshold).
 func sessionPrefixAgeMs(prefix string, nowMs int64) (uint64, bool) {
 	if len(prefix) != 12 {
 		return 0, false
@@ -142,7 +152,8 @@ func sessionPrefixAgeMs(prefix string, nowMs int64) (uint64, bool) {
 	}
 	const mask36 = uint64(0xfffffffff)
 	recMs36 := ((^v & 0xffffffffffff) >> 12) & mask36
-	return (uint64(nowMs)&mask36 - recMs36) & mask36, true
+	// NOTE: parentheses are load-bearing — in Go, & binds tighter than -.
+	return (((uint64(nowMs) & mask36) - recMs36) & mask36), true
 }
 
 // isForwardableSession reports whether a downstream session id may be sent
@@ -159,16 +170,13 @@ func isForwardableSession(session string, nowMs int64) bool {
 	return true
 }
 
-// setZenSessionHeaders sets the x-opencode-* identity headers on an upstream
-// Zen request. Downstream session IDs are forwarded when fresh and
-// genuine-shaped; UUIDs, older ses_ formats, all-hex spoof shapes, and stale
-// (>24h) sessions are deterministically normalized so every client reaches
-// the same sticky-routing lane with a gate-accepted value.
-func setZenSessionHeaders(upReq *http.Request, down http.Header, stickyKey string) {
-	if upReq == nil {
-		return
-	}
-
+// resolveUpstreamSession selects the session id for an upstream request. It
+// is pure (no request needed) so handlers can stamp it into the upstream
+// body BEFORE sending: Zen's free-tier gate requires prompt_cache_key to
+// equal x-opencode-session (probed 2026-10-14 — mismatched pairs 403 while
+// matched pairs 200 under otherwise identical bytes), exactly as stock
+// opencode sends (its cache key IS the session affinity).
+func resolveUpstreamSession(down http.Header, stickyKey string) string {
 	session := strings.TrimSpace(down.Get(zenHeaderSession))
 	if session == "" {
 		session = strings.TrimSpace(down.Get(zenHeaderAffinity))
@@ -185,17 +193,30 @@ func setZenSessionHeaders(upReq *http.Request, down http.Header, stickyKey strin
 	if session == "" {
 		session = fallbackSessionID()
 	}
+	return session
+}
+
+// setZenSessionHeadersWithSession sets the x-opencode-* identity headers
+// from an explicitly resolved session (see resolveUpstreamSession). Use it
+// whenever the handler also stamps the session into the upstream body, so
+// header and prompt_cache_key are guaranteed identical.
+func setZenSessionHeadersWithSession(upReq *http.Request, down http.Header, session string) {
+	if upReq == nil {
+		return
+	}
 	upReq.Header.Set(zenHeaderSession, session)
 	// The current OpenCode request path also sends these two affinity forms;
 	// keeping them equal avoids a second identity path in Zen's router.
 	upReq.Header.Set(zenHeaderAffinity, session)
 	upReq.Header.Set(zenHeaderSessionID, session)
 
-	request := strings.TrimSpace(down.Get(zenHeaderRequest))
-	if request == "" || !strings.HasPrefix(request, "msg_") || len(request) != 30 {
-		request = synthRequestID()
-	}
-	upReq.Header.Set(zenHeaderRequest, request)
+	// NOTE (2026-10-14 probe): x-opencode-request (zenHeaderRequest) is
+	// deliberately NEVER sent upstream, even when the downstream client
+	// provided one. Stock opencode does not emit this header on Zen LLM
+	// requests, and Zen's free-tier gate rejects any request carrying it
+	// (presence check — even a genuine-shaped ascending value 403s, while
+	// the identical request without it returns 200). Forwarding a
+	// downstream value would fail the same way, so it is stripped.
 
 	project := strings.TrimSpace(down.Get(zenHeaderProject))
 	if project == "" {
@@ -210,8 +231,41 @@ func setZenSessionHeaders(upReq *http.Request, down http.Header, stickyKey strin
 	upReq.Header.Set(zenHeaderClient, client)
 }
 
+// setZenSessionHeaders sets the x-opencode-* identity headers on an upstream
+// Zen request. Downstream session IDs are forwarded when fresh and
+// genuine-shaped; UUIDs, older ses_ formats, all-hex spoof shapes, and stale
+// sessions are deterministically normalized so every client reaches the
+// same sticky-routing lane with a gate-accepted value.
+//
+// Handlers that also carry a prompt_cache_key in the upstream body must use
+// resolveUpstreamSession + stampPromptCacheKey + setZenSessionHeadersWithSession
+// instead, so header and body key are identical (Zen rejects mismatched
+// pairs on the free-tier lane).
+func setZenSessionHeaders(upReq *http.Request, down http.Header, stickyKey string) {
+	setZenSessionHeadersWithSession(upReq, down, resolveUpstreamSession(down, stickyKey))
+}
+
+// stampPromptCacheKey sets prompt_cache_key=session on an OpenAI Chat or
+// Responses JSON body, keeping it identical to x-opencode-session the way
+// stock opencode sends it. Non-object bodies pass through untouched.
+func stampPromptCacheKey(upBody []byte, session string) ([]byte, error) {
+	var payload map[string]json.RawMessage
+	if err := json.Unmarshal(upBody, &payload); err != nil {
+		return nil, fmt.Errorf("decode upstream body: %w", err)
+	}
+	if payload == nil {
+		return upBody, nil
+	}
+	key, err := json.Marshal(session)
+	if err != nil {
+		return nil, fmt.Errorf("encode session: %w", err)
+	}
+	payload["prompt_cache_key"] = key
+	return json.Marshal(payload)
+}
+
 // synthSessionID derives a stock-formatted session id deterministically from
-// the sticky key: a genuine descending-timestamp prefix for the current 12h
+// the sticky key: a genuine descending-timestamp prefix for the current 30m
 // bucket plus a hash-derived base62 tail. Same sticky key maps to the same
 // upstream session within a bucket (stable sticky routing across turns and
 // restarts); the bucket rotation keeps the timestamp fresh for Zen's
@@ -233,7 +287,7 @@ const synthIDAlphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrs
 // fallbackSessionID is the session id used when neither the downstream
 // client nor the sticky key yields one. It follows Zen's accepted shape: a
 // genuine descending-timestamp prefix plus random base62 tail. The tail is
-// process-stable (coherent routing); the prefix tracks the current 12h
+// process-stable (coherent routing); the prefix tracks the current 30m
 // bucket so long-lived processes never go stale for the free-tier gate.
 var (
 	fallbackSessionOnce sync.Once
@@ -257,38 +311,7 @@ func fallbackSessionID() string {
 	return "ses_" + descendingSessionPrefix(sessionBucketStart(time.Now().UnixMilli()), 1) + string(tail[:])
 }
 
-// ascendingRequestPrefix returns the 12-hex opencode Identifier prefix for a
-// per-request id: the low 48 bits of ts*0x1000+counter, big-endian hex.
-// Replicates schema/identifier.ts ascending(), which stock opencode uses for
-// msg_* request ids.
-func ascendingRequestPrefix(tsMillis int64, counter uint64) string {
-	current := (uint64(tsMillis)<<12 | (counter & 0xfff)) & 0xffffffffffff
-	var b [6]byte
-	for i := 0; i < 6; i++ {
-		b[i] = byte(current >> (40 - 8*i))
-	}
-	return hex.EncodeToString(b[:])
-}
-
-var requestIDCounter atomic.Uint64
-
-// synthRequestID returns a stock-formatted request id (msg_ + ascending
-// timestamp prefix + 14 base62 chars), exactly like opencode's
-// SessionMessage ID creation. The counter is process-wide and monotonic,
-// mirroring stock behavior; only the tail is crypto-random per request.
-func synthRequestID() string {
-	counter := requestIDCounter.Add(1)
-	prefix := ascendingRequestPrefix(time.Now().UnixMilli(), counter)
-	var tail [14]byte
-	if _, err := rand.Read(tail[:]); err != nil {
-		// Fall back to a zero tail rather than failing the request.
-		for i := range tail {
-			tail[i] = 0
-		}
-	}
-	var out [14]byte
-	for i, v := range tail {
-		out[i] = synthIDAlphabet[int(v)%len(synthIDAlphabet)]
-	}
-	return "msg_" + prefix + string(out[:])
-}
+// NOTE: there is deliberately no request-id synthesis here. Stock opencode
+// does not send x-opencode-request on Zen LLM requests and Zen rejects any
+// request carrying it (2026-10-14 probe), so the header is never emitted;
+// see setZenSessionHeaders.

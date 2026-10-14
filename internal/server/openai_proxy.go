@@ -58,6 +58,17 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 			return
 		}
 
+		// Pair prompt_cache_key with the session header (Zen rejects
+		// mismatched pairs on the free-tier lane). Routing above keeps
+		// using cacheKey; only the sent values are unified here.
+		session := resolveUpstreamSession(r.Header, cacheKey)
+		upBody, err = stampPromptCacheKey(upBody, session)
+		if err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "api_error",
+				"could not prepare upstream request: "+err.Error())
+			return
+		}
+
 		upURL := strings.TrimRight(upstream, "/") + "/v1/chat/completions"
 		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upURL, bytes.NewReader(upBody))
 		if err != nil {
@@ -68,7 +79,7 @@ func (s *Server) OpenAIProxy() http.HandlerFunc {
 		upReq.Header.Set("Authorization", "Bearer "+zenKey)
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("User-Agent", ocUA())
-		setZenSessionHeaders(upReq, r.Header, cacheKey)
+		setZenSessionHeadersWithSession(upReq, r.Header, session)
 		if upstreamStream {
 			upReq.Header.Set("Accept", "text/event-stream")
 		} else {

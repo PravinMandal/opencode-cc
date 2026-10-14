@@ -54,3 +54,35 @@ func TestOcUAFormat(t *testing.T) {
 		t.Fatalf("ocUA() = %q, contains preview output", ua)
 	}
 }
+
+// TestOcUAPrefersNewestLine is the regression test for the Oct 2026 gate
+// change that rejects older-line versions (1.18.35 403s, 2.0.18 200s): on
+// this machine a mise shim reports the v1 line while the stock installer
+// binary carries v2, and the UA must name the newest installed release.
+func TestOcUAPrefersNewestLine(t *testing.T) {
+	ua := ocUA()
+	ver := strings.Split(ua, "/")[2]
+	if compareSemver(ver, "2.0.0") < 0 {
+		t.Errorf("ocUA() = %q, want a v2-line version (parallel v1 installs must not win)", ua)
+	}
+}
+
+func TestCompareSemver(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"2.0.18", "1.18.35", 1},
+		{"1.18.35", "2.0.18", -1},
+		{"2.0.18", "2.0.18", 0},
+		{"2.0.5", "2.0.22", -1},
+		{"1.19.0", "1.18.35", 1},
+		{"10.0.0", "9.99.99", 1},
+		{"2.0", "2.0.0", 0}, // non-conforming ranks equal, never crashes
+	}
+	for _, c := range cases {
+		if got := compareSemver(c.a, c.b); got != c.want {
+			t.Errorf("compareSemver(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}

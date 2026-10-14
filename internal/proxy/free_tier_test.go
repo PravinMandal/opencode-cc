@@ -38,8 +38,13 @@ func TestPrepareFreeChatBodyAddsCanonicalGateShape(t *testing.T) {
 	if err := json.Unmarshal(out, &payload); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if !payload.Stream || payload.ToolChoice != "auto" || !payload.StreamOptions["include_usage"] {
-		t.Fatalf("gate fields = stream:%v choice:%v options:%v", payload.Stream, payload.ToolChoice, payload.StreamOptions)
+	if !payload.Stream || !payload.StreamOptions["include_usage"] {
+		t.Fatalf("gate fields = stream:%v options:%v", payload.Stream, payload.StreamOptions)
+	}
+	// Oct 2026 gate: tool_choice must be ABSENT on the chat lane (stock
+	// opencode omits it; sending "auto" 403s).
+	if payload.ToolChoice != nil {
+		t.Fatalf("tool_choice = %v, want absent on free chat lane", payload.ToolChoice)
 	}
 	seen := map[string]bool{}
 	for _, tool := range payload.Tools {
@@ -62,5 +67,16 @@ func TestPrepareFreeResponsesBodyAddsGateTools(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"stream":true`) {
 		t.Fatalf("response stream was not forced: %s", out)
+	}
+	// Oct 2026 gate: marker text is blocklisted, compat tools must carry
+	// stock opencode definitions.
+	if strings.Contains(string(out), "compatibility marker") {
+		t.Fatalf("marker text present; Zen rejects it: %s", out)
+	}
+	if !strings.Contains(string(out), "Execute a shell command") {
+		t.Fatalf("stock shell description missing: %s", out)
+	}
+	if !strings.Contains(string(out), `"strict":false`) {
+		t.Fatalf("stock strict:false missing: %s", out)
 	}
 }

@@ -49,8 +49,12 @@ func (s *Server) proxyAnthropicViaResponses(
 	timeoutSeconds int,
 	start time.Time,
 ) {
+	// Resolve ONE session for body prompt_cache_key and headers alike: Zen
+	// rejects mismatched pairs on the free-tier lane (stock opencode always
+	// sends them equal). stickyKey stays the routing/cache-hint input.
+	session := resolveUpstreamSession(r.Header, stickyKey)
 	upBody, err := proxy.ConvertAnthropicToResponsesBody(areq, targetModel, proxy.BridgeOptions{
-		PromptCacheKey: stickyKey,
+		PromptCacheKey: session,
 		EffortLevels:   s.levelsForModel(targetModel),
 		DefaultEffort:  s.cfg.BridgeDefaultEffort,
 	})
@@ -104,7 +108,7 @@ func (s *Server) proxyAnthropicViaResponses(
 	upReq.Header.Set("Authorization", "Bearer "+zenKey)
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
-	setZenSessionHeaders(upReq, r.Header, stickyKey)
+	setZenSessionHeadersWithSession(upReq, r.Header, session)
 	if upstreamStream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {

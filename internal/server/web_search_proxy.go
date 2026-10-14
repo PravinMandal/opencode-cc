@@ -315,6 +315,10 @@ func (s *Server) doOpenAIChat(
 	stream bool,
 	timeoutSeconds int,
 ) (*proxy.OpenAIResponse, error) {
+	// Pair prompt_cache_key with the session header (Zen rejects mismatched
+	// pairs on the free-tier lane): resolve one session and use it for both.
+	session := resolveUpstreamSession(down.Header, req.PromptCacheKey)
+	req.PromptCacheKey = session
 	upBody, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("could not encode upstream request: %w", err)
@@ -328,7 +332,7 @@ func (s *Server) doOpenAIChat(
 	upReq.Header.Set("Authorization", "Bearer "+zenKey)
 	upReq.Header.Set("Accept", "application/json")
 	upReq.Header.Set("User-Agent", ocUA())
-	setZenSessionHeaders(upReq, down.Header, req.PromptCacheKey)
+	setZenSessionHeadersWithSession(upReq, down.Header, session)
 
 	resp, err := s.upstreamClient(stream, timeoutSeconds).Do(upReq)
 	if err != nil {

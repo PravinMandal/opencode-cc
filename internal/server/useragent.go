@@ -11,17 +11,11 @@ import (
 const (
 	// fallbackOCVersion is used only when no installed opencode binary reports
 	// a stable version (missing binary, probe failure, or a prerelease-only
-	// install). Kept current with the installed release so a broken probe
-	// still sends a plausible version to Zen's free-tier gate, which validates
-	// the semver shape.
-	//
-	// Runtime detection is preferred and is what normally runs: detectOCVersion
-	// probes `/usr/bin/opencode`, `opencode1`, then `opencode` with
-	// `--version` and takes the first stable semver, so upgrading opencode
-	// needs no code change here. Verified on 2026-10-02 to emit
-	// `opencode/latest/2.0.22/cli` for an installed v2.0.22; only this
-	// fallback constant needed bumping.
-	fallbackOCVersion = "2.0.22"
+	// install). It is a known-real, known-accepted release: Zen's free-tier
+	// gate validates the version value (probed 2026-10-14 — a real but
+	// parallel-line 1.18.35 UA 403s while 2.0.18 200s), so the fallback must
+	// name a release that exists on the v2 line, not a guessed number.
+	fallbackOCVersion = "2.0.18"
 	// The current OpenCode installation format is
 	// opencode/<channel>/<version>/<client>. Zen's free-tier gate validates
 	// this shape, so do not append the old AI SDK suffix here.
@@ -66,31 +60,88 @@ func isStableOCVersion(v string) bool {
 	return true
 }
 
-// detectOCVersion probes the installed opencode binaries and uses the first
-// stable release. Preview/dev builds are skipped; fallbackOCVersion is
-// returned when no stable version is found.
+// compareSemver compares two stable X.Y.Z versions numerically.
+// Returns -1/0/+1. Non-conforming inputs compare as equal (0) so callers
+// treat them as unranked rather than crashing.
+func compareSemver(a, b string) int {
+	parse := func(v string) ([3]int, bool) {
+		var out [3]int
+		rest := v
+		for i := 0; i < 3; i++ {
+			n := 0
+			digits := 0
+			for len(rest) > 0 && rest[0] >= '0' && rest[0] <= '9' {
+				n = n*10 + int(rest[0]-'0')
+				rest = rest[1:]
+				digits++
+			}
+			if digits == 0 {
+				return out, false
+			}
+			out[i] = n
+			if i < 2 {
+				if len(rest) == 0 || rest[0] != '.' {
+					return out, false
+				}
+				rest = rest[1:]
+			}
+		}
+		return out, true
+	}
+	pa, oka := parse(a)
+	pb, okb := parse(b)
+	if !oka || !okb {
+		return 0
+	}
+	for i := 0; i < 3; i++ {
+		if pa[i] != pb[i] {
+			if pa[i] < pb[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// detectOCVersion probes every known opencode binary location and uses the
+// NEWEST stable release found — never the first hit. Rationale (2026-10-14):
+// version managers can shadow the real install with a parallel release line
+// (e.g. a mise shim reporting v1.18.35 while ~/.opencode/bin carries
+// v2.0.18), and Zen's free-tier gate validates the version VALUE, rejecting
+// the older line. Newest-wins tracks user upgrades with no code change.
+// Preview/dev builds are skipped; fallbackOCVersion is returned when no
+// stable version is found anywhere.
 func detectOCVersion() string {
 	candidates := [][]string{
 		{"/usr/bin/opencode", "--version"},
+		{"/usr/local/bin/opencode", "--version"},
 		{"opencode1", "--version"},
 		{"opencode", "--version"},
 	}
 	// Explicit home installs: systemd services and other restricted-PATH
 	// environments may not resolve bare "opencode" even though it exists.
+	// The stock installer binary lives in ~/.opencode/bin.
 	if home := os.Getenv("HOME"); home != "" {
 		candidates = append(candidates,
 			[]string{home + "/.opencode/bin/opencode", "--version"},
 			[]string{home + "/.local/bin/opencode", "--version"},
 		)
 	}
+	best := ""
 	for _, c := range candidates {
 		out, err := exec.Command(c[0], c[1:]...).Output()
 		if err != nil {
 			continue
 		}
 		if v := parseOCVersion(strings.TrimSpace(string(out))); isStableOCVersion(v) {
-			return v
+			if best == "" || compareSemver(v, best) > 0 {
+				best = v
+			}
 		}
 	}
-	return fallbackOCVersion
+	if best == "" {
+		return fallbackOCVersion
+	}
+	return best
 }

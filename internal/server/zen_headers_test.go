@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,15 +20,18 @@ func TestSetZenSessionHeadersForwardsClientValues(t *testing.T) {
 	// freshness are both required since the Oct 2026 gate).
 	fresh := "ses_" + descendingSessionPrefix(time.Now().UnixMilli(), 3) + "abcdefghijklmn"
 	down.Set("x-opencode-session", fresh)
-	down.Set("x-opencode-request", "msg_abcdefghijklmnopqrstuvwxyz")
 	down.Set("x-opencode-project", "prj_9")
 	down.Set("x-opencode-client", "opencode")
 	setZenSessionHeaders(up, down, "sticky-should-lose")
 	if got := up.Header.Get("x-opencode-session"); got != fresh {
 		t.Errorf("session = %q, want forwarded client value %q", got, fresh)
 	}
-	if got := up.Header.Get("x-opencode-request"); got != "msg_abcdefghijklmnopqrstuvwxyz" {
-		t.Errorf("request = %q, want forwarded client value", got)
+	// x-opencode-request is never forwarded upstream (Oct 2026 gate
+	// rejects any request carrying it), even when the client sent one.
+	down.Set("x-opencode-request", "msg_abcdefghijklmnopqrstuvwxyz")
+	setZenSessionHeaders(up, down, "sticky-should-lose")
+	if got := up.Header.Get("x-opencode-request"); got != "" {
+		t.Errorf("request = %q, want it stripped upstream", got)
 	}
 	if got := up.Header.Get("x-opencode-project"); got != "prj_9" {
 		t.Errorf("project = %q, want forwarded client value", got)
@@ -63,8 +67,8 @@ func TestSetZenSessionHeadersSynthesizes(t *testing.T) {
 	if up2.Header.Get("x-opencode-session") != up.Header.Get("x-opencode-session") {
 		t.Errorf("session not stable for same sticky key")
 	}
-	if got := up.Header.Get("x-opencode-request"); !strings.HasPrefix(got, "msg_") || len(got) != 30 {
-		t.Errorf("request = %q, want stock msg_ format", got)
+	if got := up.Header.Get("x-opencode-request"); got != "" {
+		t.Errorf("request = %q, want it stripped upstream (Oct 2026 gate)", got)
 	}
 	if got := up.Header.Get("x-opencode-client"); got != "cli" {
 		t.Errorf("client = %q, want stock cli", got)
@@ -79,10 +83,41 @@ func TestSetZenSessionHeadersSynthesizes(t *testing.T) {
 		t.Errorf("session id = %q, want it to match x-opencode-session", got)
 	}
 	// No proxy fingerprint anywhere.
-	for _, h := range []string{"x-opencode-session", "x-opencode-request", "x-opencode-client"} {
+	for _, h := range []string{"x-opencode-session", "x-opencode-client"} {
 		if strings.Contains(strings.ToLower(up.Header.Get(h)), "opencode-cc") {
 			t.Errorf("header %s leaks proxy identity: %q", h, up.Header.Get(h))
 		}
+	}
+}
+
+// TestNeverSendsRequestHeader is the regression test for the Oct 2026 gate
+// change (FreeTierError on any request carrying x-opencode-request, which
+// stock opencode never sends): the header must be absent upstream no matter
+// what the downstream client sent.
+func TestNeverSendsRequestHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		down http.Header
+	}{
+		{"absent", http.Header{}},
+		{"random", func() http.Header {
+			h := http.Header{}
+			h.Set("x-opencode-request", "msg_"+"z26%#@!random-garbage-value!!")
+			return h
+		}()},
+		{"genuine-shaped", func() http.Header {
+			h := http.Header{}
+			h.Set("x-opencode-request", "msg_135cd2800007abcdefghijklmn")
+			return h
+		}()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up, _ := http.NewRequest(http.MethodPost, "http://x/v1/responses", nil)
+			setZenSessionHeaders(up, tc.down, "sticky-key")
+			if got := up.Header.Get("x-opencode-request"); got != "" {
+				t.Errorf("x-opencode-request = %q, want absent upstream", got)
+			}
+		})
 	}
 }
 
@@ -177,6 +212,84 @@ func TestHexDownstreamSessionResynthed(t *testing.T) {
 	}
 }
 
+// TestSessionPairStamped: resolveUpstreamSession + stampPromptCacheKey must
+// agree — the pair Zen's free-tier gate requires (mismatched pairs 403
+// under otherwise identical bytes, probed live 2026-10-14).
+func TestSessionPairStamped(t *testing.T) {
+	down := http.Header{}
+	session := resolveUpstreamSession(down, "sticky-pair-test")
+	if !isForwardableSession(session, time.Now().UnixMilli()) {
+		t.Fatalf("resolved session = %q, want gate-accepted shape", session)
+	}
+	stamped, err := stampPromptCacheKey([]byte(`{"model":"m","stream":true}`), session)
+	if err != nil {
+		t.Fatalf("stamp: %v", err)
+	}
+	var payload struct {
+		PromptCacheKey string `json:"prompt_cache_key"`
+		Model          string `json:"model"`
+	}
+	if err := json.Unmarshal(stamped, &payload); err != nil {
+		t.Fatalf("decode stamped: %v", err)
+	}
+	if payload.PromptCacheKey != session {
+		t.Errorf("cachekey = %q, want header session %q", payload.PromptCacheKey, session)
+	}
+	if payload.Model != "m" {
+		t.Errorf("stamp clobbered body: %s", stamped)
+	}
+	up, _ := http.NewRequest(http.MethodPost, "http://x/v1/responses", nil)
+	setZenSessionHeadersWithSession(up, down, session)
+	if got := up.Header.Get("x-opencode-session"); got != session {
+		t.Errorf("header session = %q, want %q", got, session)
+	}
+}
+
+// TestResolveUpstreamSessionDeterministic: same inputs resolve identically
+// (header/body pair stays matched across retries and restarts).
+func TestResolveUpstreamSessionDeterministic(t *testing.T) {
+	down := http.Header{}
+	a := resolveUpstreamSession(down, "sticky-det")
+	b := resolveUpstreamSession(down, "sticky-det")
+	if a != b {
+		t.Errorf("resolve not deterministic: %q vs %q", a, b)
+	}
+	if _, err := stampPromptCacheKey([]byte(`not json`), a); err == nil {
+		t.Errorf("stamp accepted non-JSON body")
+	}
+}
+
+// TestSessionBucketStart aligns to 30m boundaries (keeps synthesized
+// sessions far inside Zen's ~2h unknown-session freshness window).
+func TestSessionBucketStart(t *testing.T) {
+	// 2026-10-14 12:00:00 UTC in millis.
+	const noon = int64(1791979200000)
+	if got := sessionBucketStart(noon); got != noon {
+		t.Errorf("bucket(noon) = %d, want %d", got, noon)
+	}
+	if got := sessionBucketStart(noon + 29*60*1000); got != noon {
+		t.Errorf("bucket(noon+29m) = %d, want %d", got, noon)
+	}
+	if got := sessionBucketStart(noon + 30*60*1000); got != noon+30*60*1000 {
+		t.Errorf("bucket(noon+30m) = %d, want next bucket", got)
+	}
+}
+
+// TestForwardableAgeBoundary: downstream sessions under/over the 1h refresh
+// threshold (2x margin under the narrowest observed ~2h gate window).
+func TestForwardableAgeBoundary(t *testing.T) {
+	now := time.Now().UnixMilli()
+	mk := func(ageMs int64) string {
+		return "ses_" + descendingSessionPrefix(now-ageMs, 3) + "abcdefghijklmn"
+	}
+	if !isForwardableSession(mk(59*60*1000), now) {
+		t.Errorf("59m-old session not forwardable")
+	}
+	if isForwardableSession(mk(61*60*1000), now) {
+		t.Errorf("61m-old session forwardable; must refresh")
+	}
+}
+
 // TestStaleDownstreamSessionResynthed: a genuine-shaped but >24h-old
 // downstream session is re-synthesized (fresh timestamp, same stickiness)
 // instead of risking a FreeTierError on Zen's recency check.
@@ -213,45 +326,6 @@ func TestSessionPrefixAgeDecodes(t *testing.T) {
 	}
 	if _, ok := sessionPrefixAgeMs("zzzzzzzzzzzz", now); ok {
 		t.Errorf("non-hex prefix decoded without error")
-	}
-}
-
-// TestAscendingRequestPrefixVector pins the msg_* construction to opencode's
-// ascending() algorithm.
-func TestAscendingRequestPrefixVector(t *testing.T) {
-	if got := ascendingRequestPrefix(1791904000000, 7); got != "135cd2800007" {
-		t.Errorf("prefix = %q, want 135cd2800007", got)
-	}
-}
-
-// TestSynthRequestIDShape: msg_ + 12-hex ascending-timestamp prefix (decodes
-// to ~now) + 14 base62 chars, unique per call.
-func TestSynthRequestIDShape(t *testing.T) {
-	a := synthRequestID()
-	b := synthRequestID()
-	for _, id := range []string{a, b} {
-		if !strings.HasPrefix(id, "msg_") || len(id) != 30 {
-			t.Fatalf("request = %q, want stock msg_ format", id)
-		}
-		rest := strings.TrimPrefix(id, "msg_")
-		prefix, tail := rest[:12], rest[12:]
-		v, err := strconv.ParseUint(prefix, 16, 48)
-		if err != nil {
-			t.Fatalf("request prefix %q is not hex", prefix)
-		}
-		const mask36 = uint64(0xfffffffff)
-		age := (uint64(time.Now().UnixMilli())&mask36 - ((v >> 12) & mask36)) & mask36
-		if age > 3600*1000 {
-			t.Errorf("request = %q decodes to %dms old, want ~now", id, age)
-		}
-		for _, c := range tail {
-			if !strings.ContainsRune(synthIDAlphabet, c) {
-				t.Fatalf("request tail %q has non-base62 char", tail)
-			}
-		}
-	}
-	if a == b {
-		t.Errorf("request ids not unique: %q", a)
 	}
 }
 
@@ -306,7 +380,11 @@ func TestPassthroughSendsSessionHeaders(t *testing.T) {
 	if gotSession != fresh {
 		t.Errorf("upstream session = %q, want forwarded downstream value %q", gotSession, fresh)
 	}
-	if gotClient == "" || gotRequest == "" {
-		t.Errorf("upstream client=%q request=%q, want both set", gotClient, gotRequest)
+	if gotClient == "" {
+		t.Errorf("upstream client=%q, want set", gotClient)
+	}
+	// x-opencode-request must never reach upstream (Oct 2026 gate).
+	if gotRequest != "" {
+		t.Errorf("upstream request=%q, want absent", gotRequest)
 	}
 }

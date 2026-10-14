@@ -539,6 +539,33 @@ forced SSE is aggregated back to JSON for non-streaming clients. The compatibili
 protocol wiring in `internal/server/{proxy.go,openai_proxy.go,responses_proxy.go,responses_passthrough.go,anthropic_responses.go}` and
 session synthesis in `internal/server/zen_headers.go`.
 
+## Self-maintaining free lane (no-repatch design)
+
+opencode-cc no longer hardcodes everything Zen needs. Like stock opencode
+itself, it follows the live Zen console config at runtime:
+
+- **Console following** (`internal/server/zenconfig.go`): per upstream API
+  key, the proxy fetches `GET {zen-host}/console/api/v2/config` (same call
+  stock opencode makes at startup), caches provider baseURL + headers for 5
+  minutes, and merges them into upstream requests. Endpoint migrations and
+  newly required headers apply without a rebuild; any fetch failure degrades
+  to the baked-in behavior.
+- **Cross-gateway failover**: on a `FreeTierError`-signature 403,
+  `doFreeTierPost` replays the identical bytes once against the alternate
+  gateway (`/zen` <-> `/inference/...`, per protocol) and returns that
+  response. Other statuses, transport errors, and paid lanes are untouched.
+- **Gate watchdog**: consecutive `FreeTierError` rejections log a loud
+  runbook line after 3 in a row; totals/streak are on `/healthz`
+  (`free_tier_gate_rejections_total/consec`) for alerting. A genuinely novel
+  rule still needs a human with the capture→replay→bisect probes
+  (`BUN_CONFIG_VERBOSE_FETCH=curl` on a stock `opencode serve`, replay via
+  Python, flip single fields), but it is now detected in minutes.
+
+What still needs a human: a brand-new *value* rule (sessions/tools/headers)
+requires re-matching, and a version floor above the installed opencode
+requires upgrading opencode itself — the proxy reports the newest installed
+release and cannot invent a newer one.
+
 The local deployment uses `muse-spark-1.3-contributor-free` with `xhigh`
 reasoning for both harnesses:
 

@@ -319,6 +319,17 @@ func isFreeTierRejection(status int, body []byte) bool {
 	return strings.Contains(strings.ToLower(string(body)), "free tier")
 }
 
+// isLimitRejection reports whether an upstream status+body is Zen's
+// free-usage rate limiter (as opposed to transport failures, which must
+// never fail over or count toward the limit watchdog).
+func isLimitRejection(status int, body []byte) bool {
+	if status != http.StatusTooManyRequests {
+		return false
+	}
+	lowered := strings.ToLower(string(body))
+	return strings.Contains(lowered, "rate limit") || strings.Contains(lowered, "freeusagelimit")
+}
+
 // doFreeTierPost is doUpstreamWithRetry plus free-lane failover: on a
 // FreeTierError-signature 403 it replays the identical bytes against the
 // alternate gateway once and returns that response (whatever its status),
@@ -330,6 +341,11 @@ func (s *Server) doFreeTierPost(client *http.Client, upReq *http.Request, upBody
 	resp, err := doUpstreamWithRetry(client, upReq, upBody)
 	if err != nil || resp == nil {
 		return resp, err
+	}
+	if resp.StatusCode == http.StatusTooManyRequests && strings.TrimSpace(suffix) != "" {
+		// Rate-limit rejections fail over across address families (same
+		// URL); other 429s and paid lanes (suffix "") pass through.
+		return s.doFreeTierPost429(client, upReq, upBody, resp)
 	}
 	if resp.StatusCode != http.StatusForbidden || strings.TrimSpace(suffix) == "" {
 		if resp.StatusCode < http.StatusBadRequest {
@@ -372,6 +388,51 @@ func (s *Server) doFreeTierPost(client *http.Client, upReq *http.Request, upBody
 	return altResp, nil
 }
 
+// doFreeTierPost429 is the rate-limit twin of the 403 failover above,
+// factored so both entry points share it: on a FreeUsageLimitRejection-429
+// it replays the identical bytes once through the v6-pinned pool (same URL,
+// other address family) and returns that response. Rationale (probed live
+// 2026-10-14): the limiter is edge-family-scoped — 4/4 IPv4 edges returned
+// 200 while 2/2 IPv6 edges returned 429 for identical bytes+key — so the
+// other family is the only retry target with independent budget. Anything
+// else (non-429, other 429 text, transport errors) passes through exactly
+// like doUpstreamWithRetry, keeping total per-turn upstream attempts bounded
+// (cli-proxyapi already retries above us; we add at most one).
+func (s *Server) doFreeTierPost429(client *http.Client, upReq *http.Request, upBody []byte, resp *http.Response) (*http.Response, error) {
+	saved, ok := peekErrorBody(resp)
+	if !ok || !isLimitRejection(resp.StatusCode, saved) {
+		restoreErrorBody(resp, saved)
+		return resp, nil
+	}
+	s.noteLimitRejection()
+	log.Printf("opencode-cc: free-tier 429 on %s, failing over across address family (same bytes, one attempt)",
+		truncateErr(upReq.URL.String()))
+	altReq := cloneWithBody(upReq, upBody)
+	altResp, altErr := s.familyFailoverClient(client.Timeout).Do(altReq)
+	if altErr != nil || altResp == nil {
+		// Failover transport failed: report the original rate-limit, which
+		// carries any Retry-After the caller should honor.
+		restoreErrorBody(resp, saved)
+		return resp, nil
+	}
+	if altResp.StatusCode < http.StatusBadRequest {
+		s.noteLimitSuccess()
+		s.noteGateSuccess()
+	}
+	resp.Body.Close()
+	return altResp, nil
+}
+
+// familyFailoverClient returns an http.Client sharing the caller's timeout
+// but dialing through the v6-pinned pool (separate from the prefer-v4 main
+// pool so the retry is guaranteed a fresh family).
+func (s *Server) familyFailoverClient(timeout time.Duration) *http.Client {
+	if s == nil || s.fam6Transport == nil {
+		return http.DefaultClient
+	}
+	return &http.Client{Transport: s.fam6Transport, Timeout: timeout}
+}
+
 // ---- gate watchdog ----
 
 // gateAlertStreak is documented above with the constant block.
@@ -410,6 +471,54 @@ func (s *Server) gateTotalCount() int64 {
 	s.gateMu.Lock()
 	defer s.gateMu.Unlock()
 	return s.gateTotal
+}
+
+func (s *Server) noteLimitRejection() {
+	if s == nil {
+		return
+	}
+	s.limitMu.Lock()
+	s.limitConsec++
+	s.limitTotal++
+	n := s.limitConsec
+	last := s.limitLastAlert
+	now := time.Now()
+	fire := n == gateAlertStreak || (n > gateAlertStreak && now.Sub(last) > 15*time.Minute)
+	if fire {
+		s.limitLastAlert = now
+	}
+	s.limitMu.Unlock()
+	if fire {
+		log.Printf("opencode-cc: FREE-TIER QUOTA/EDGE BUDGET? %d consecutive 429 FreeUsageLimitError rejections from Zen. "+
+			"Family failover already engaged (v4<->v6); if it persists, all edges/keys are exhausted: lower harness concurrency, "+
+			"shrink contexts, or wait for the quota window. Total limit rejections: %d.", n, s.limitTotalCount())
+	}
+}
+
+func (s *Server) noteLimitSuccess() {
+	if s == nil {
+		return
+	}
+	s.limitMu.Lock()
+	s.limitConsec = 0
+	s.limitMu.Unlock()
+}
+
+func (s *Server) limitTotalCount() int64 {
+	s.limitMu.Lock()
+	defer s.limitMu.Unlock()
+	return s.limitTotal
+}
+
+// LimitStatus returns (total rejections, current consecutive streak) for the
+// /healthz endpoint. Wired via SetLimitStatusFunc like SetGateStatusFunc.
+func (s *Server) LimitStatus() (int64, int) {
+	if s == nil {
+		return 0, 0
+	}
+	s.limitMu.Lock()
+	defer s.limitMu.Unlock()
+	return s.limitTotal, s.limitConsec
 }
 
 // GateStatus returns (total rejections, current consecutive streak) for the

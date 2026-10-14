@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -40,6 +41,72 @@ type Server struct {
 	gateConsec    int
 	gateTotal     int64
 	gateLastAlert time.Time
+	// Limit watchdog: same shape for FreeUsageLimitError 429s (quota/edge
+	// budgets rather than identity-gate rejections).
+	limitMu        sync.Mutex
+	limitConsec    int
+	limitTotal     int64
+	limitLastAlert time.Time
+	// fam6Transport is a pool-separated clone of the upstream transport
+	// with IPv6-pinned dialing, used ONLY for the one-shot family failover
+	// on rate-limit rejections (see dialer.go). Separate pools so a
+	// failover attempt can never reuse a hot-family pooled connection.
+	fam6Transport *http.Transport
+}
+
+// zenBaseDialer carries the shared TCP dial settings for all upstream
+// transports (10s connect bound, 75m keepalive outliving the 1h idle
+// window). One instance is shared because net.Dialer is safe for
+// concurrent use and its fields are never mutated after construction.
+var zenBaseDialer = &net.Dialer{
+	Timeout:   10 * time.Second,
+	KeepAlive: 75 * time.Minute,
+}
+
+// newUpstreamTransport builds the hardened shared transport (large pools,
+// long idle window, 30s header bound, H1-only), differing only in the dial
+// function: prefer-IPv4 for the main pool, v6-pinned for the failover pool.
+// See dialer.go for why the family matters, and the inline comments (kept
+// from the original literal) for the other knobs.
+func newUpstreamTransport(dialFn func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Transport {
+	return &http.Transport{
+		MaxIdleConns: 256,
+		// Concurrency headroom so agent bursts (parallel subagents +
+		// retries) reuse pooled sockets instead of opening new ones.
+		MaxIdleConnsPerHost: 32,
+		// Explicit dialer. Without this the transport silently uses
+		// net/http's default (30s KeepAlive, 30s dial timeout), which
+		// is shorter than our idle window and lets the OS reap a warm
+		// socket early. KeepAlive outlives upstreamIdleTimeout so a
+		// pooled connection is never torn down underneath the pool;
+		// Timeout bounds the TCP connect on a cold connection.
+		DialContext: dialFn,
+		// Cold-connection cliff (measured Oct 2026): a request arriving
+		// after >90s of upstream idleness must re-handshake TLS, which
+		// costs ~600ms of TTFT (full handshake measured at 562ms; the
+		// edge TTFB itself is only ~450ms). Paired A/B against the
+		// upstream showed warm pooled connections are ~610ms faster
+		// per request than fresh ones, and that HTTP/1.1 vs HTTP/2 is
+		// irrelevant while warm (498ms vs 520ms TTFB) - so a long idle
+		// timeout is strictly better than any protocol change.
+		// keepWarmUpstreams() pings the pool well inside this window so
+		// sockets stay usable across long thinking gaps.
+		IdleConnTimeout: upstreamIdleTimeout,
+		// Bound the wait for upstream response headers on every
+		// request, streams included.
+		ResponseHeaderTimeout: 30 * time.Second,
+		// HTTP/1.1 only upstream. Sep 2026 forensics (SIGQUIT
+		// goroutine dump) proved the wedge: one HTTP/2 connection
+		// to a Cloudflare edge stalled in flow control (peer
+		// stopped sending WINDOW_UPDATE; 75KB stuck in Send-Q) and
+		// every route sharing this client queued on it forever —
+		// Go's auto-H2 transport exposes no read-idle/ping
+		// timeout knobs, and no request timeout can fire on a
+		// stream. H1 isolates a stall to its own connection, which
+		// the timeouts bound; fresh requests open fresh conns.
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+	}
 }
 
 // New constructs a Server. The store may be nil if request logging is disabled.
@@ -55,49 +122,10 @@ func New(cfg *config.Config, st *store.Store) *Server {
 		done:          make(chan struct{}),
 		consoleRoutes: newConsoleRouteCache(),
 		httpClient: &http.Client{
-			Timeout: 0, // streaming: no global timeout (per-request override used)
-			Transport: &http.Transport{
-				MaxIdleConns: 256,
-				// Concurrency headroom so agent bursts (parallel subagents +
-				// retries) reuse pooled sockets instead of opening new ones.
-				MaxIdleConnsPerHost: 32,
-				// Explicit dialer. Without this the transport silently uses
-				// net/http's default (30s KeepAlive, 30s dial timeout), which
-				// is shorter than our idle window and lets the OS reap a warm
-				// socket early. KeepAlive outlives upstreamIdleTimeout so a
-				// pooled connection is never torn down underneath the pool;
-				// Timeout bounds the TCP connect on a cold connection.
-				DialContext: (&net.Dialer{
-					Timeout:   10 * time.Second,
-					KeepAlive: 75 * time.Minute,
-				}).DialContext,
-				// Cold-connection cliff (measured Oct 2026): a request arriving
-				// after >90s of upstream idleness must re-handshake TLS, which
-				// costs ~600ms of TTFT (full handshake measured at 562ms; the
-				// edge TTFB itself is only ~450ms). Paired A/B against the
-				// upstream showed warm pooled connections are ~610ms faster
-				// per request than fresh ones, and that HTTP/1.1 vs HTTP/2 is
-				// irrelevant while warm (498ms vs 520ms TTFB) - so a long idle
-				// timeout is strictly better than any protocol change.
-				// keepWarmUpstreams() pings the pool well inside this window so
-				// sockets stay usable across long thinking gaps.
-				IdleConnTimeout: upstreamIdleTimeout,
-				// Bound the wait for upstream response headers on every
-				// request, streams included.
-				ResponseHeaderTimeout: 30 * time.Second,
-				// HTTP/1.1 only upstream. Sep 2026 forensics (SIGQUIT
-				// goroutine dump) proved the wedge: one HTTP/2 connection
-				// to a Cloudflare edge stalled in flow control (peer
-				// stopped sending WINDOW_UPDATE; 75KB stuck in Send-Q) and
-				// every route sharing this client queued on it forever —
-				// Go's auto-H2 transport exposes no read-idle/ping
-				// timeout knobs, and no request timeout can fire on a
-				// stream. H1 isolates a stall to its own connection, which
-				// the timeouts bound; fresh requests open fresh conns.
-				ForceAttemptHTTP2: false,
-				TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
-			},
+			Timeout:   0, // streaming: no global timeout (per-request override used)
+			Transport: newUpstreamTransport(dialOpencodeAware(zenBaseDialer, false)),
 		},
+		fam6Transport: newUpstreamTransport(dialOpencodeAware(zenBaseDialer, true)),
 	}
 }
 
@@ -189,6 +217,7 @@ func (s *Server) Shutdown() error {
 func (s *Server) mountPanelAPI(mux *http.ServeMux) {
 	api.SetInvalidateCache(InvalidateKeyCache)
 	api.SetGateStatusFunc(s.GateStatus)
+	api.SetLimitStatusFunc(s.LimitStatus)
 	api.New(s.cfg, s.store).Mount(mux)
 }
 

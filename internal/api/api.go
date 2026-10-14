@@ -105,6 +105,14 @@ var gateStatusFunc func() (int64, int)
 // monitoring can alert on gate changes without log scraping.
 func SetGateStatusFunc(fn func() (int64, int)) { gateStatusFunc = fn }
 
+// limitStatusFunc reports the rate-limit watchdog counters
+// (total 429s, current consecutive streak); nil when unwired (tests).
+var limitStatusFunc func() (int64, int)
+
+// SetLimitStatusFunc wires the limit watchdog reporter from the server
+// package, same pattern as SetGateStatusFunc.
+func SetLimitStatusFunc(fn func() (int64, int)) { limitStatusFunc = fn }
+
 // auth gates the panel API behind the configured panel token. If no token is
 // configured, access is open (convenient for localhost-only use).
 func (a *API) auth(next http.Handler) http.Handler {
@@ -172,6 +180,13 @@ func (a *API) health(w http.ResponseWriter, r *http.Request) {
 		total, consec := gateStatusFunc()
 		body["free_tier_gate_rejections_total"] = total
 		body["free_tier_gate_rejections_consec"] = consec
+	}
+	// Free-tier quota/edge-budget watchdog: nonzero streak means Zen is
+	// currently rate-limiting our free-lane requests.
+	if limitStatusFunc != nil {
+		total, consec := limitStatusFunc()
+		body["free_tier_limit_rejections_total"] = total
+		body["free_tier_limit_rejections_consec"] = consec
 	}
 	writeJSON(w, http.StatusOK, body)
 }

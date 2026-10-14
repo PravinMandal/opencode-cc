@@ -1,7 +1,9 @@
 package server
 
 import (
+	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -197,6 +199,88 @@ func TestDoFreeTierPostFailover(t *testing.T) {
 	}
 	if total, consec := s.GateStatus(); total != 1 || consec != 0 {
 		t.Errorf("watchdog total=%d consec=%d, want 1/0 (success resets streak)", total, consec)
+	}
+}
+
+func TestIsLimitRejection(t *testing.T) {
+	if !isLimitRejection(429, []byte(`{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}`)) {
+		t.Errorf("genuine limit body not detected")
+	}
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{403, "rate limit"}, {500, "rate limit"}, {429, "invalid key"},
+		{429, ""}, {429, "quota exhausted"}, {200, "rate limit"},
+	} {
+		if isLimitRejection(tc.status, []byte(tc.body)) {
+			t.Errorf("false positive: %d %q", tc.status, tc.body)
+		}
+	}
+}
+
+func TestDoFreeTierPostFamilyFailover(t *testing.T) {
+	var altBody []byte
+	alt := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		altBody, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read alt body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer alt.Close()
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `{"type":"error","error":{"type":"FreeUsageLimitError","message":"Rate limit exceeded. Please try again later."}}`)
+	}))
+	defer primary.Close()
+
+	s := testServerWithConsole()
+	// Point the v6-pinned pool at the mock alt server regardless of address.
+	altURL := alt.URL
+	s.fam6Transport = &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, strings.TrimPrefix(altURL, "http://"))
+		},
+	}
+	upReq, _ := http.NewRequest(http.MethodPost, primary.URL+"/v1/responses", strings.NewReader(`{"model":"m"}`))
+	resp, err := s.doFreeTierPost(http.DefaultClient, upReq, []byte(`{"model":"m"}`), "k", "https://opencode.ai/zen", "/v1/responses")
+	if err != nil {
+		t.Fatalf("failover err: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want failover 200", resp.StatusCode)
+	}
+	if string(altBody) != `{"model":"m"}` {
+		t.Errorf("alt got bytes %q, want identical replay", altBody)
+	}
+	if total, consec := s.LimitStatus(); total != 1 || consec != 0 {
+		t.Errorf("limit watchdog total=%d consec=%d, want 1/0 (success resets streak)", total, consec)
+	}
+}
+
+func TestDoFreeTierPostLimitNoFailover(t *testing.T) {
+	s := testServerWithConsole()
+	// Paid/native lanes (suffix "") never fail over, even on limit text.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = io.WriteString(w, `rate limit exceeded`)
+	}))
+	defer srv.Close()
+	upReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages", strings.NewReader(`{}`))
+	resp, err := s.doFreeTierPost(http.DefaultClient, upReq, []byte(`{}`), "k", "https://opencode.ai/zen", "")
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Errorf("status = %d, want passthrough 429", resp.StatusCode)
+	}
+	if total, consec := s.LimitStatus(); total != 0 || consec != 0 {
+		t.Errorf("watchdog total=%d consec=%d, want 0/0 (suffix-gated)", total, consec)
 	}
 }
 

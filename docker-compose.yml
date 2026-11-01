@@ -1,0 +1,17 @@
+name: opencode-cc
+
+services:
+  opencode-cc:
+    build: .
+    image: opencode-cc:local
+    container_name: opencode-cc
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      OPENCODE_CC_PANEL_TOKEN: ${OPENCODE_CC_PANEL_TOKEN:?Set a private panel password before starting}
+    volumes:
+      - opencode-cc-data:/data
+
+volumes:
+  opencode-cc-data:
